@@ -3,10 +3,16 @@ import requests
 import json
 import os
 import base64
+import io
 import tomllib
 from pathlib import Path
 from docling.document_converter import DocumentConverter
 from supabase import create_client, Client
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 
 def get_supabase_key_role(key: str) -> str:
@@ -61,6 +67,8 @@ def get_ollama_config():
         "url": os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/"),
         "model": os.getenv("OLLAMA_MODEL", "qwen2.5vl:3b"),
         "timeout": int(os.getenv("OLLAMA_TIMEOUT", "300")),
+        "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "8192")),
+        "image_max_dimension": int(os.getenv("OLLAMA_IMAGE_MAX_DIMENSION", "1280")),
         "json_mode": os.getenv("OLLAMA_JSON_MODE", "true").lower() in {"1", "true", "yes"},
         "warmup": os.getenv("OLLAMA_WARMUP", "true").lower() in {"1", "true", "yes"},
     }
@@ -108,6 +116,7 @@ def validate_ollama_access():
     installed_models = list_ollama_models()
     print(f"Ollama endpoint: {config['url']}")
     print(f"Configured model: {config['model']}")
+    print(f"Context window (num_ctx): {config['num_ctx']}")
     print(f"Installed models: {', '.join(installed_models) if installed_models else '(none)'}")
 
     if config["model"] not in installed_models:
@@ -146,6 +155,7 @@ def call_ollama_chat(messages, response_format="json"):
     }
     if response_format:
         ollama_payload["format"] = response_format
+    ollama_payload["options"] = {"num_ctx": config["num_ctx"]}
 
     try:
         ollama_res = requests.post(
@@ -187,9 +197,38 @@ def call_ollama_chat(messages, response_format="json"):
 
     return message["content"]
 
+def prepare_image_bytes_for_ollama(image_path):
+    config = get_ollama_config()
+    max_dimension = config["image_max_dimension"]
+
+    if Image is None:
+        with open(image_path, "rb") as image_file:
+            return image_file.read(), "original"
+
+    with Image.open(image_path) as image:
+        image = image.convert("RGB")
+        width, height = image.size
+
+        if max(width, height) > max_dimension:
+            scale = max_dimension / max(width, height)
+            resized = (
+                max(1, int(width * scale)),
+                max(1, int(height * scale)),
+            )
+            image = image.resize(resized, Image.Resampling.LANCZOS)
+            size_label = f"{width}x{height} -> {resized[0]}x{resized[1]}"
+        else:
+            size_label = f"{width}x{height}"
+
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=85, optimize=True)
+        return buffer.getvalue(), size_label
+
+
 def encode_image_base64(image_path):
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode("utf-8")
+    image_bytes, size_label = prepare_image_bytes_for_ollama(image_path)
+    print(f"Prepared image for Ollama vision input ({size_label}, {len(image_bytes)} bytes).")
+    return base64.b64encode(image_bytes).decode("utf-8")
 
 
 def parse_json_response(ai_text):
@@ -233,25 +272,18 @@ def extract_document_with_ollama(image_path, markdown_layout):
     print(f"Docling OCR extracted {docling_chars} characters of markdown text.")
 
     user_prompt = (
-        "Read every piece of visible text in this document image. "
-        "Include handwritten text, printed labels, field values, dates, numbers, "
-        "checkboxes, and any other readable content.\n\n"
-        "Return valid JSON with this shape:\n"
-        "{\n"
-        '  "extracted_payload": {\n'
-        '    "full_text": "all readable text from the image, preserving line breaks where helpful",\n'
-        '    "fields": {"label": "value"},\n'
-        '    "summary": "short description of the document"\n'
-        "  }\n"
-        "}\n\n"
-        "Do not leave full_text empty if any text is visible in the image."
+        "Read all visible text in this image and return JSON only:\n"
+        '{"extracted_payload":{"full_text":"...","fields":{},"summary":"..."}}\n'
+        "Put every readable word into full_text. Do not leave it empty."
     )
 
     if docling_chars > 0:
+        markdown_hint = markdown_layout.strip()
+        if len(markdown_hint) > 1500:
+            markdown_hint = markdown_hint[:1500] + "\n...[truncated]"
         user_prompt += (
-            "\n\nSupplementary OCR markdown from Docling "
-            "(use only as a hint; trust the image if they disagree):\n\n"
-            f"{markdown_layout}"
+            "\n\nOptional OCR hint from Docling (trust the image if different):\n"
+            f"{markdown_hint}"
         )
 
     ai_text = call_ollama_chat(
