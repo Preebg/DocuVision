@@ -197,15 +197,67 @@ def call_ollama_chat(messages, response_format="json"):
 
     return message["content"]
 
-def prepare_image_bytes_for_ollama(image_path):
+def is_pdf_path(file_path):
+    return Path(file_path).suffix.lower() == ".pdf"
+
+
+def render_pdf_pages_for_ollama(pdf_path):
+    try:
+        import fitz
+    except ImportError as e:
+        raise RuntimeError(
+            "PDF support requires PyMuPDF. Install it with: pip install pymupdf"
+        ) from e
+
+    config = get_ollama_config()
+    max_dimension = config["image_max_dimension"]
+    max_pages = int(os.getenv("OLLAMA_PDF_MAX_PAGES", "5"))
+
+    rendered_pages = []
+    with fitz.open(pdf_path) as doc:
+        page_count = len(doc)
+        pages_to_render = min(page_count, max_pages)
+        if page_count > max_pages:
+            print(
+                f"PDF has {page_count} pages; sending the first {max_pages} "
+                "page image(s) to Ollama."
+            )
+
+        for page_index in range(pages_to_render):
+            page = doc[page_index]
+            rect = page.rect
+            if rect.width <= 0 or rect.height <= 0:
+                continue
+
+            scale = min(max_dimension / rect.width, max_dimension / rect.height, 2.0)
+            scale = max(scale, 0.1)
+            matrix = fitz.Matrix(scale, scale)
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            image_bytes = pixmap.tobytes("jpeg")
+            label = (
+                f"pdf page {page_index + 1}/{page_count} "
+                f"({pixmap.width}x{pixmap.height})"
+            )
+            rendered_pages.append((image_bytes, label))
+
+    if not rendered_pages:
+        raise RuntimeError("PDF did not contain any renderable pages.")
+
+    return rendered_pages
+
+
+def prepare_images_for_ollama(file_path):
+    if is_pdf_path(file_path):
+        return render_pdf_pages_for_ollama(file_path)
+
     config = get_ollama_config()
     max_dimension = config["image_max_dimension"]
 
     if Image is None:
-        with open(image_path, "rb") as image_file:
-            return image_file.read(), "original"
+        with open(file_path, "rb") as image_file:
+            return [(image_file.read(), "original")]
 
-    with Image.open(image_path) as image:
+    with Image.open(file_path) as image:
         image = image.convert("RGB")
         width, height = image.size
 
@@ -222,13 +274,17 @@ def prepare_image_bytes_for_ollama(image_path):
 
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=85, optimize=True)
-        return buffer.getvalue(), size_label
+        return [(buffer.getvalue(), size_label)]
 
 
-def encode_image_base64(image_path):
-    image_bytes, size_label = prepare_image_bytes_for_ollama(image_path)
-    print(f"Prepared image for Ollama vision input ({size_label}, {len(image_bytes)} bytes).")
-    return base64.b64encode(image_bytes).decode("utf-8")
+def encode_images_base64(file_path):
+    encoded_images = []
+    for image_bytes, size_label in prepare_images_for_ollama(file_path):
+        print(
+            f"Prepared vision input ({size_label}, {len(image_bytes)} bytes)."
+        )
+        encoded_images.append(base64.b64encode(image_bytes).decode("utf-8"))
+    return encoded_images
 
 
 def parse_json_response(ai_text):
@@ -261,10 +317,11 @@ def is_empty_extraction(parsed_json):
     return False
 
 
-def extract_document_with_ollama(image_path, markdown_layout):
+def extract_document_with_ollama(file_path, markdown_layout):
     ollama_config = get_ollama_config()
+    document_type = "PDF" if is_pdf_path(file_path) else "image"
     print(
-        f"Stage 2: Analyzing image with Ollama model "
+        f"Stage 2: Analyzing {document_type} with Ollama model "
         f"'{ollama_config['model']}' at {ollama_config['url']}..."
     )
 
@@ -272,7 +329,7 @@ def extract_document_with_ollama(image_path, markdown_layout):
     print(f"Docling OCR extracted {docling_chars} characters of markdown text.")
 
     user_prompt = (
-        "Read all visible text in this image and return JSON only:\n"
+        "Read all visible text in the attached document page image(s) and return JSON only:\n"
         '{"extracted_payload":{"full_text":"...","fields":{},"summary":"..."}}\n'
         "Put every readable word into full_text. Do not leave it empty."
     )
@@ -282,23 +339,24 @@ def extract_document_with_ollama(image_path, markdown_layout):
         if len(markdown_hint) > 1500:
             markdown_hint = markdown_hint[:1500] + "\n...[truncated]"
         user_prompt += (
-            "\n\nOptional OCR hint from Docling (trust the image if different):\n"
+            "\n\nOptional OCR hint from Docling (trust the page image(s) if different):\n"
             f"{markdown_hint}"
         )
 
+    vision_images = encode_images_base64(file_path)
     ai_text = call_ollama_chat(
         [
             {
                 "role": "system",
                 "content": (
                     "You are a document OCR and extraction engine. "
-                    "You must read the attached image directly and return only valid JSON."
+                    "You must read the attached page image(s) directly and return only valid JSON."
                 ),
             },
             {
                 "role": "user",
                 "content": user_prompt,
-                "images": [encode_image_base64(image_path)],
+                "images": vision_images,
             },
         ],
         response_format="json" if ollama_config["json_mode"] else None,
@@ -323,8 +381,13 @@ def is_processable_upload(file_entry):
     if not file_name or file_name == ".emptyFolderPlaceholder":
         return False
 
+    suffix = Path(file_name).suffix.lower()
+    if suffix in {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}:
+        return True
+
     metadata = file_entry.get("metadata") or {}
-    if metadata.get("mimetype", "").startswith("image/"):
+    mimetype = metadata.get("mimetype", "")
+    if mimetype.startswith(("image/", "application/pdf")):
         return True
 
     # Root-level uploads are files; nested entries without metadata are folders.
@@ -348,7 +411,7 @@ def validate_supabase_access():
         raise SystemExit(f"Could not reach Supabase storage: {e}") from e
 
     uploads = [file for file in files if is_processable_upload(file)]
-    print(f"Startup scan: {len(uploads)} image(s) waiting in incoming_forms")
+    print(f"Startup scan: {len(uploads)} document(s) waiting in incoming_forms")
     return uploads
 
 
@@ -361,11 +424,11 @@ def listen_for_phone_uploads():
 
     uploads = [file for file in files if is_processable_upload(file)]
     if uploads:
-        print(f"[SCAN] Found {len(uploads)} image(s) in incoming_forms")
+        print(f"[SCAN] Found {len(uploads)} document(s) in incoming_forms")
 
     for file in uploads:
         file_name = file["name"]
-        print(f"\n[NEW CAPTURE] Found phone image upload: {file_name}")
+        print(f"\n[NEW CAPTURE] Found document upload: {file_name}")
         process_pipeline(file_name)
 
 def process_pipeline(file_name):
@@ -384,7 +447,7 @@ def process_pipeline(file_name):
         conversion_result = get_doc_converter().convert(local_temp_path)
         markdown_layout = conversion_result.document.export_to_markdown()
 
-        # Step C: Send the actual image to the vision model for text extraction
+        # Step C: Send rendered page image(s) to the vision model for text extraction
         parsed_json = extract_document_with_ollama(local_temp_path, markdown_layout)
 
         # Step D: Save perfect structural payload back up to your tracking database
