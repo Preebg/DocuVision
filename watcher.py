@@ -55,6 +55,63 @@ def get_doc_converter():
         doc_converter = DocumentConverter()
     return doc_converter
 
+
+def get_ollama_config():
+    return {
+        "url": os.getenv("OLLAMA_URL", "http://localhost:11434"),
+        "model": os.getenv("OLLAMA_MODEL", "qwen2.5-vl:3b"),
+        "timeout": int(os.getenv("OLLAMA_TIMEOUT", "300")),
+    }
+
+
+def call_ollama_chat(messages, response_format="json"):
+    config = get_ollama_config()
+    ollama_payload = {
+        "model": config["model"],
+        "messages": messages,
+        "stream": False,
+        "format": response_format,
+    }
+
+    try:
+        ollama_res = requests.post(
+            f"{config['url']}/api/chat",
+            json=ollama_payload,
+            timeout=config["timeout"],
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(
+            f"Could not reach Ollama at {config['url']}. "
+            "Make sure Ollama is running on this machine."
+        ) from e
+
+    try:
+        response_data = ollama_res.json()
+    except ValueError as e:
+        raise RuntimeError(
+            f"Ollama returned a non-JSON response (HTTP {ollama_res.status_code}): "
+            f"{ollama_res.text[:500]}"
+        ) from e
+
+    if ollama_res.status_code != 200:
+        error_message = response_data.get("error") or response_data
+        raise RuntimeError(
+            f"Ollama request failed (HTTP {ollama_res.status_code}): {error_message}"
+        )
+
+    if "error" in response_data:
+        raise RuntimeError(f"Ollama error: {response_data['error']}")
+
+    message = response_data.get("message")
+    if not message or "content" not in message:
+        raise RuntimeError(
+            "Ollama returned an unexpected response shape. "
+            f"Response keys: {list(response_data.keys())}. "
+            f"Full response: {response_data}"
+        )
+
+    return message["content"]
+
 def list_incoming_form_files():
     return supabase.storage.from_("incoming_forms").list()
 
@@ -111,12 +168,13 @@ def listen_for_phone_uploads():
 
 def process_pipeline(file_name):
     local_temp_path = f"./temp_{file_name}"
-    
+    pipeline_succeeded = False
+
     try:
         # Step A: Download photo from cloud bucket down onto spare PC hardware
         print("Downloading form from secure storage queue...")
         with open(local_temp_path, "wb") as f:
-            res = supabase.storage.from_('incoming_forms').download(file_name)
+            res = supabase.storage.from_("incoming_forms").download(file_name)
             f.write(res)
 
         # Step B: Execute Docling local layout/structural analysis
@@ -125,46 +183,51 @@ def process_pipeline(file_name):
         markdown_layout = conversion_result.document.export_to_markdown()
 
         # Step C: Pipe clean text structure directly into Qwen 2.5 via local Ollama port
-        print("Stage 2: Passing layout payload to Qwen via local Ollama...")
+        ollama_config = get_ollama_config()
+        print(
+            f"Stage 2: Passing layout payload to Ollama model "
+            f"'{ollama_config['model']}' at {ollama_config['url']}..."
+        )
         system_prompt = (
             "You are a strict data parsing engine. Read this Markdown text extracted from a form. "
-            "Convert it into a valid JSON object with describing what is in the image. add the description to the 'extracted_payload' key. Do not add any extra text or commentary. "
+            "Convert it into a valid JSON object describing what is in the image. "
+            "Add the description to the 'extracted_payload' key. "
+            "Do not add any extra text or commentary."
         )
-        
-        ollama_payload = {
-            "model": "qwen2.5-vl:3b", # Ensure this matches your downloaded tag exactly
-            "messages": [
+
+        ai_text = call_ollama_chat(
+            [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Document Text Structure:\n\n{markdown_layout}"}
-            ],
-            "stream": False,
-            "format": "json"
-        }
-        
-        ollama_res = requests.post("http://localhost:11434/api/chat", json=ollama_payload, timeout=60)
-        ai_text = ollama_res.json()['message']['content']
+                {"role": "user", "content": f"Document Text Structure:\n\n{markdown_layout}"},
+            ]
+        )
         parsed_json = json.loads(ai_text)
 
         # Step D: Save perfect structural payload back up to your tracking database
         print("Stage 3: Storing structural JSON data back into Supabase database...")
         supabase.table("document_pipeline").insert({
             "file_name": file_name,
-            "extracted_payload": parsed_json
+            "extracted_payload": parsed_json,
         }).execute()
 
+        pipeline_succeeded = True
         print(f"[SUCCESS] Form processing complete for {file_name}. Logged to database.")
 
     except Exception as e:
-        print(f"[PIPELINE CRASH] Failed processing: {e}")
-        
+        print(f"[PIPELINE CRASH] Failed processing {file_name}: {e}")
+        print(
+            "The file was left in incoming_forms so you can retry after fixing the issue."
+        )
+
     finally:
-        # Clean up local temp file and purge bucket so it won't loop process
         if os.path.exists(local_temp_path):
             os.remove(local_temp_path)
-        try:
-            supabase.storage.from_('incoming_forms').remove([file_name])
-        except Exception:
-            pass
+
+        if pipeline_succeeded:
+            try:
+                supabase.storage.from_("incoming_forms").remove([file_name])
+            except Exception as e:
+                print(f"[WARNING] Processed file but could not remove it from storage: {e}")
 
 if __name__ == "__main__":
     print("=== Secure On-Premises Docling + Qwen 2.5 Pipeline Online ===")
