@@ -6,9 +6,7 @@ from docling.document_converter import DocumentConverter
 from supabase import create_client, Client
 
 # 1. Setup Environment Connections
-SUPABASE_URL = "YOUR_SUPABASE_URL"
-SUPABASE_KEY = "YOUR_SUPABASE_ANON_KEY"
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 # Initialize Docling Layout Engine
 doc_converter = DocumentConverter()
