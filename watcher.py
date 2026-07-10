@@ -2,10 +2,21 @@ import time
 import requests
 import json
 import os
+import base64
 import tomllib
 from pathlib import Path
 from docling.document_converter import DocumentConverter
 from supabase import create_client, Client
+
+
+def get_supabase_key_role(key: str) -> str:
+    try:
+        payload = key.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data.get("role", "unknown")
+    except Exception:
+        return "unknown"
 
 
 def load_supabase_credentials():
@@ -30,7 +41,9 @@ def load_supabase_credentials():
 
 
 # 1. Setup Environment Connections
-supabase: Client = create_client(*load_supabase_credentials())
+SUPABASE_URL, SUPABASE_KEY = load_supabase_credentials()
+SUPABASE_KEY_ROLE = get_supabase_key_role(SUPABASE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Initialize Docling Layout Engine lazily (first run downloads models and can take a while)
 doc_converter = None
@@ -42,19 +55,57 @@ def get_doc_converter():
         doc_converter = DocumentConverter()
     return doc_converter
 
-def listen_for_phone_uploads():
-    # Poll the storage bucket for new form images
+def list_incoming_form_files():
+    return supabase.storage.from_("incoming_forms").list()
+
+
+def is_processable_upload(file_entry):
+    file_name = file_entry.get("name", "")
+    if not file_name or file_name == ".emptyFolderPlaceholder":
+        return False
+
+    metadata = file_entry.get("metadata") or {}
+    if metadata.get("mimetype", "").startswith("image/"):
+        return True
+
+    # Root-level uploads are files; nested entries without metadata are folders.
+    return file_entry.get("id") is not None
+
+
+def validate_supabase_access():
+    print(f"Connected to Supabase project: {SUPABASE_URL}")
+    print(f"Using Supabase key role: {SUPABASE_KEY_ROLE}")
+
+    if SUPABASE_KEY_ROLE != "service_role":
+        print(
+            "[WARNING] This watcher needs the service_role key in secrets.toml. "
+            "The anon/publishable key cannot list private bucket files because "
+            "incoming_forms only allows authenticated users."
+        )
+
     try:
-        files = supabase.storage.from_('incoming_forms').list()
+        files = list_incoming_form_files()
+    except Exception as e:
+        raise SystemExit(f"Could not reach Supabase storage: {e}") from e
+
+    uploads = [file for file in files if is_processable_upload(file)]
+    print(f"Startup scan: {len(uploads)} image(s) waiting in incoming_forms")
+    return uploads
+
+
+def listen_for_phone_uploads():
+    try:
+        files = list_incoming_form_files()
     except Exception as e:
         print(f"Connection error to Supabase: {e}")
         return
 
-    for file in files:
-        file_name = file['name']
-        if file_name == '.emptyFolderPlaceholder':
-            continue
-        
+    uploads = [file for file in files if is_processable_upload(file)]
+    if uploads:
+        print(f"[SCAN] Found {len(uploads)} image(s) in incoming_forms")
+
+    for file in uploads:
+        file_name = file["name"]
         print(f"\n[NEW CAPTURE] Found phone image upload: {file_name}")
         process_pipeline(file_name)
 
@@ -117,6 +168,7 @@ def process_pipeline(file_name):
 
 if __name__ == "__main__":
     print("=== Secure On-Premises Docling + Qwen 2.5 Pipeline Online ===")
+    validate_supabase_access()
     while True:
         listen_for_phone_uploads()
-        time.sleep(3) # Scan your queue bucket every 3 seconds
+        time.sleep(3)  # Scan your queue bucket every 3 seconds
