@@ -58,10 +58,83 @@ def get_doc_converter():
 
 def get_ollama_config():
     return {
-        "url": os.getenv("OLLAMA_URL", "http://localhost:11434"),
-        "model": os.getenv("OLLAMA_MODEL", "qwen2.5-vl:3b"),
+        "url": os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/"),
+        "model": os.getenv("OLLAMA_MODEL", "qwen2.5vl:3b"),
         "timeout": int(os.getenv("OLLAMA_TIMEOUT", "300")),
+        "json_mode": os.getenv("OLLAMA_JSON_MODE", "true").lower() in {"1", "true", "yes"},
+        "warmup": os.getenv("OLLAMA_WARMUP", "true").lower() in {"1", "true", "yes"},
     }
+
+
+def list_ollama_models():
+    config = get_ollama_config()
+    try:
+        response = requests.get(f"{config['url']}/api/tags", timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(
+            f"Could not reach Ollama at {config['url']}. "
+            "Start the Ollama app or run `ollama serve` in a separate terminal."
+        ) from e
+
+    payload = response.json()
+    return [model["name"] for model in payload.get("models", [])]
+
+
+def suggest_ollama_model_name(requested_model, installed_models):
+    if not installed_models:
+        return None
+
+    requested_lower = requested_model.lower()
+    for model in installed_models:
+        if model.lower() == requested_lower:
+            return model
+
+    # Common typo: qwen2.5v1:3b vs qwen2.5vl:3b
+    normalized = requested_lower.replace("v1", "vl")
+    for model in installed_models:
+        if model.lower() == normalized:
+            return model
+
+    for model in installed_models:
+        if requested_lower in model.lower() or model.lower() in requested_lower:
+            return model
+
+    return installed_models[0]
+
+
+def validate_ollama_access():
+    config = get_ollama_config()
+    installed_models = list_ollama_models()
+    print(f"Ollama endpoint: {config['url']}")
+    print(f"Configured model: {config['model']}")
+    print(f"Installed models: {', '.join(installed_models) if installed_models else '(none)'}")
+
+    if config["model"] not in installed_models:
+        suggestion = suggest_ollama_model_name(config["model"], installed_models)
+        typo_hint = ""
+        if config["model"].lower().replace("v1", "vl") != config["model"].lower():
+            typo_hint = (
+                "\nDid you mean 'qwen2.5vl:3b'? "
+                "The model uses the letter L in 'vl', not the number 1 in 'v1'."
+            )
+        suggestion_hint = f"\nTry instead: OLLAMA_MODEL={suggestion}" if suggestion else ""
+        raise SystemExit(
+            f"Configured Ollama model '{config['model']}' is not installed.{typo_hint}"
+            f"{suggestion_hint}\n"
+            f"Run: ollama pull qwen2.5vl:3b"
+        )
+
+    if not config["warmup"]:
+        print("Ollama warmup skipped.")
+        return
+
+    print("Warming up Ollama model (first load can take a minute)...")
+    warmup_text = call_ollama_chat(
+        [{"role": "user", "content": 'Reply with exactly {"ok": true}'}],
+        response_format="json" if config["json_mode"] else None,
+    )
+    print(f"Ollama warmup succeeded: {warmup_text[:120]}")
 
 
 def call_ollama_chat(messages, response_format="json"):
@@ -70,8 +143,9 @@ def call_ollama_chat(messages, response_format="json"):
         "model": config["model"],
         "messages": messages,
         "stream": False,
-        "format": response_format,
     }
+    if response_format:
+        ollama_payload["format"] = response_format
 
     try:
         ollama_res = requests.post(
@@ -82,7 +156,7 @@ def call_ollama_chat(messages, response_format="json"):
     except requests.RequestException as e:
         raise RuntimeError(
             f"Could not reach Ollama at {config['url']}. "
-            "Make sure Ollama is running on this machine."
+            "Make sure the Ollama app is running on this machine."
         ) from e
 
     try:
@@ -96,11 +170,12 @@ def call_ollama_chat(messages, response_format="json"):
     if ollama_res.status_code != 200:
         error_message = response_data.get("error") or response_data
         raise RuntimeError(
-            f"Ollama request failed (HTTP {ollama_res.status_code}): {error_message}"
+            f"Ollama request failed (HTTP {ollama_res.status_code}) for model "
+            f"'{config['model']}': {error_message}"
         )
 
     if "error" in response_data:
-        raise RuntimeError(f"Ollama error: {response_data['error']}")
+        raise RuntimeError(f"Ollama error for model '{config['model']}': {response_data['error']}")
 
     message = response_data.get("message")
     if not message or "content" not in message:
@@ -111,6 +186,101 @@ def call_ollama_chat(messages, response_format="json"):
         )
 
     return message["content"]
+
+def encode_image_base64(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode("utf-8")
+
+
+def parse_json_response(ai_text):
+    try:
+        return json.loads(ai_text)
+    except json.JSONDecodeError:
+        start = ai_text.find("{")
+        end = ai_text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(ai_text[start : end + 1])
+
+
+def is_empty_extraction(parsed_json):
+    if not parsed_json:
+        return True
+
+    payload = parsed_json.get("extracted_payload", parsed_json)
+    if isinstance(payload, str):
+        return not payload.strip()
+
+    if isinstance(payload, dict):
+        text_values = [
+            str(value).strip()
+            for value in payload.values()
+            if isinstance(value, (str, int, float))
+        ]
+        return not any(text_values)
+
+    return False
+
+
+def extract_document_with_ollama(image_path, markdown_layout):
+    ollama_config = get_ollama_config()
+    print(
+        f"Stage 2: Analyzing image with Ollama model "
+        f"'{ollama_config['model']}' at {ollama_config['url']}..."
+    )
+
+    docling_chars = len(markdown_layout.strip())
+    print(f"Docling OCR extracted {docling_chars} characters of markdown text.")
+
+    user_prompt = (
+        "Read every piece of visible text in this document image. "
+        "Include handwritten text, printed labels, field values, dates, numbers, "
+        "checkboxes, and any other readable content.\n\n"
+        "Return valid JSON with this shape:\n"
+        "{\n"
+        '  "extracted_payload": {\n'
+        '    "full_text": "all readable text from the image, preserving line breaks where helpful",\n'
+        '    "fields": {"label": "value"},\n'
+        '    "summary": "short description of the document"\n'
+        "  }\n"
+        "}\n\n"
+        "Do not leave full_text empty if any text is visible in the image."
+    )
+
+    if docling_chars > 0:
+        user_prompt += (
+            "\n\nSupplementary OCR markdown from Docling "
+            "(use only as a hint; trust the image if they disagree):\n\n"
+            f"{markdown_layout}"
+        )
+
+    ai_text = call_ollama_chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You are a document OCR and extraction engine. "
+                    "You must read the attached image directly and return only valid JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+                "images": [encode_image_base64(image_path)],
+            },
+        ],
+        response_format="json" if ollama_config["json_mode"] else None,
+    )
+    parsed_json = parse_json_response(ai_text)
+
+    if is_empty_extraction(parsed_json):
+        raise RuntimeError(
+            "Ollama returned empty extracted text. "
+            f"Raw model response: {ai_text[:500]}"
+        )
+
+    return parsed_json
+
 
 def list_incoming_form_files():
     return supabase.storage.from_("incoming_forms").list()
@@ -182,26 +352,8 @@ def process_pipeline(file_name):
         conversion_result = get_doc_converter().convert(local_temp_path)
         markdown_layout = conversion_result.document.export_to_markdown()
 
-        # Step C: Pipe clean text structure directly into Qwen 2.5 via local Ollama port
-        ollama_config = get_ollama_config()
-        print(
-            f"Stage 2: Passing layout payload to Ollama model "
-            f"'{ollama_config['model']}' at {ollama_config['url']}..."
-        )
-        system_prompt = (
-            "You are a strict data parsing engine. Read this Markdown text extracted from a form. "
-            "Convert it into a valid JSON object describing what is in the image. "
-            "Add the description to the 'extracted_payload' key. "
-            "Do not add any extra text or commentary."
-        )
-
-        ai_text = call_ollama_chat(
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Document Text Structure:\n\n{markdown_layout}"},
-            ]
-        )
-        parsed_json = json.loads(ai_text)
+        # Step C: Send the actual image to the vision model for text extraction
+        parsed_json = extract_document_with_ollama(local_temp_path, markdown_layout)
 
         # Step D: Save perfect structural payload back up to your tracking database
         print("Stage 3: Storing structural JSON data back into Supabase database...")
@@ -231,7 +383,12 @@ def process_pipeline(file_name):
 
 if __name__ == "__main__":
     print("=== Secure On-Premises Docling + Qwen 2.5 Pipeline Online ===")
+    print(
+        "Run this script with the project venv activated. "
+        "Ollama itself is a separate app and does not use the venv."
+    )
     validate_supabase_access()
+    validate_ollama_access()
     while True:
         listen_for_phone_uploads()
         time.sleep(3)  # Scan your queue bucket every 3 seconds
