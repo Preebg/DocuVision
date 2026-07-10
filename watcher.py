@@ -2,14 +2,45 @@ import time
 import requests
 import json
 import os
+import tomllib
+from pathlib import Path
 from docling.document_converter import DocumentConverter
 from supabase import create_client, Client
 
-# 1. Setup Environment Connections
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
-# Initialize Docling Layout Engine
-doc_converter = DocumentConverter()
+def load_supabase_credentials():
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
+
+    if not url or not key:
+        secrets_path = Path(__file__).with_name("secrets.toml")
+        if secrets_path.exists():
+            with secrets_path.open("rb") as secrets_file:
+                secrets = tomllib.load(secrets_file)
+            url = url or secrets.get("SUPABASE_URL")
+            key = key or secrets.get("SUPABASE_KEY")
+
+    if not url or not key:
+        raise SystemExit(
+            "Missing Supabase credentials. Set SUPABASE_URL and SUPABASE_KEY "
+            "as environment variables or add them to secrets.toml."
+        )
+
+    return url, key
+
+
+# 1. Setup Environment Connections
+supabase: Client = create_client(*load_supabase_credentials())
+
+# Initialize Docling Layout Engine lazily (first run downloads models and can take a while)
+doc_converter = None
+
+
+def get_doc_converter():
+    global doc_converter
+    if doc_converter is None:
+        doc_converter = DocumentConverter()
+    return doc_converter
 
 def listen_for_phone_uploads():
     # Poll the storage bucket for new form images
@@ -39,15 +70,14 @@ def process_pipeline(file_name):
 
         # Step B: Execute Docling local layout/structural analysis
         print("Stage 1: Running Docling structural layout conversion...")
-        conversion_result = doc_converter.convert(local_temp_path)
+        conversion_result = get_doc_converter().convert(local_temp_path)
         markdown_layout = conversion_result.document.export_to_markdown()
 
         # Step C: Pipe clean text structure directly into Qwen 2.5 via local Ollama port
         print("Stage 2: Passing layout payload to Qwen via local Ollama...")
         system_prompt = (
             "You are a strict data parsing engine. Read this Markdown text extracted from a form. "
-            "Convert it into a valid JSON object with these keys: 'applicant_name', 'date_of_birth', and 'form_type'. "
-            "Do not write preamble, summaries, or backticks. Return raw JSON syntax only."
+            "Convert it into a valid JSON object with describing what is in the image. add the description to the 'extracted_payload' key. Do not add any extra text or commentary. "
         )
         
         ollama_payload = {
