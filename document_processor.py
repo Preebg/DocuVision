@@ -1,19 +1,21 @@
 import base64
 import io
-import json
 import os
 from pathlib import Path
 
 from docling.document_converter import DocumentConverter
 
 from config import EXTRACTION_JSON_SCHEMA, FALLBACK_MODEL, PRIMARY_MODEL, get_ollama_config
+from observability import get_logger
 from ollama_client import ModelRecoverableError, call_ollama_chat
+from schema_validation import parse_json_response, validate_extraction_payload
 
 try:
     from PIL import Image
 except ImportError:
     Image = None
 
+logger = get_logger(__name__)
 
 doc_converter = None
 
@@ -46,9 +48,10 @@ def render_pdf_pages_for_ollama(pdf_path):
         page_count = len(doc)
         pages_to_render = min(page_count, max_pages)
         if page_count > max_pages:
-            print(
-                f"PDF has {page_count} pages; sending the first {max_pages} "
-                "page image(s) to Ollama."
+            logger.info(
+                "PDF has %s pages; sending the first %s page image(s) to Ollama.",
+                page_count,
+                max_pages,
             )
 
         for page_index in range(pages_to_render):
@@ -108,20 +111,13 @@ def prepare_images_for_ollama(file_path):
 def encode_images_base64(file_path):
     encoded_images = []
     for image_bytes, size_label in prepare_images_for_ollama(file_path):
-        print(f"Prepared vision input ({size_label}, {len(image_bytes)} bytes).")
+        logger.info(
+            "Prepared vision input (%s, %s bytes).",
+            size_label,
+            len(image_bytes),
+        )
         encoded_images.append(base64.b64encode(image_bytes).decode("utf-8"))
     return encoded_images
-
-
-def parse_json_response(ai_text):
-    try:
-        return json.loads(ai_text)
-    except json.JSONDecodeError:
-        start = ai_text.find("{")
-        end = ai_text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise
-        return json.loads(ai_text[start : end + 1])
 
 
 def is_empty_extraction(parsed_json):
@@ -153,7 +149,9 @@ def bundle_layout_with_prompt(markdown_layout: str) -> str:
         "You are given a document page image payload and its Docling structural markdown layout.\n"
         "Use BOTH the attached image(s) and the bundled layout text together.\n"
         "Return JSON only that strictly matches the required schema:\n"
-        '{"extracted_payload":{"full_text":"...","fields":{},"summary":"..."}}\n'
+        '{"patient_name":"...","dob":"...","form_type":"...",'
+        '"extracted_payload":{"full_text":"...","fields":{},"summary":"..."}}\n'
+        "patient_name, dob, and form_type are mandatory non-empty strings.\n"
         "Put every readable word into full_text. Do not leave it empty.\n\n"
         "Bundled Docling structural markdown layout:\n"
         f"{layout_text if layout_text else '(no layout text extracted)'}"
@@ -181,13 +179,17 @@ def build_vision_messages(file_path: str, markdown_layout: str):
 def extract_with_ollama_model(file_path: str, markdown_layout: str, model: str):
     config = get_ollama_config()
     document_type = "PDF" if is_pdf_path(file_path) else "image"
-    print(
-        f"STEP 2: Running vision extraction on {document_type} with "
-        f"Ollama model '{model}'..."
+    logger.info(
+        "STEP 2: Running vision extraction on %s with Ollama model '%s'...",
+        document_type,
+        model,
     )
 
     docling_chars = len(markdown_layout.strip())
-    print(f"Docling layout bundled with image payload ({docling_chars} characters).")
+    logger.info(
+        "Docling layout bundled with image payload (%s characters).",
+        docling_chars,
+    )
 
     response_format = EXTRACTION_JSON_SCHEMA if config["json_mode"] else None
     ai_text = call_ollama_chat(
@@ -196,21 +198,25 @@ def extract_with_ollama_model(file_path: str, markdown_layout: str, model: str):
         response_format=response_format,
     )
     parsed_json = parse_json_response(ai_text)
+    validated_json = validate_extraction_payload(parsed_json)
 
-    if is_empty_extraction(parsed_json):
+    if is_empty_extraction(validated_json):
         raise RuntimeError(
             f"Model '{model}' returned empty extracted text. "
             f"Raw model response: {ai_text[:500]}"
         )
 
-    return parsed_json
+    return validated_json
 
 
 def step1_extract_layout(local_path: str) -> str:
-    print("STEP 1: Running Docling structural layout extraction...")
+    logger.info("STEP 1: Running Docling structural layout extraction...")
     conversion_result = get_doc_converter().convert(local_path)
     markdown_layout = conversion_result.document.export_to_markdown()
-    print(f"STEP 1 complete: extracted {len(markdown_layout.strip())} layout characters.")
+    logger.info(
+        "STEP 1 complete: extracted %s layout characters.",
+        len(markdown_layout.strip()),
+    )
     return markdown_layout
 
 
@@ -218,7 +224,7 @@ def step2_and_3_vision_extraction(local_path: str, markdown_layout: str):
     try:
         return extract_with_ollama_model(local_path, markdown_layout, PRIMARY_MODEL)
     except ModelRecoverableError:
-        print(
+        logger.warning(
             "[FALLBACK] Qwen3-8B maxed out VRAM or timed out. "
             "Falling back to memory-safe recovery..."
         )

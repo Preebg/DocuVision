@@ -7,6 +7,9 @@ from config import (
     PRIMARY_MODEL,
     get_ollama_config,
 )
+from observability import get_logger
+
+logger = get_logger(__name__)
 
 
 class ModelRecoverableError(RuntimeError):
@@ -152,24 +155,30 @@ def call_ollama_chat(model: str, messages, response_format=None):
 def validate_ollama_access():
     config = get_ollama_config()
     installed_models = list_ollama_models()
-    print(f"Ollama endpoint: {config['url']}")
-    print(f"Primary model: {PRIMARY_MODEL}")
-    print(f"Fallback model: {FALLBACK_MODEL}")
-    print(f"Context window (num_ctx): {config['num_ctx']}")
-    print(f"Inference options: {OLLAMA_INFERENCE_OPTIONS}")
-    print(f"Installed models: {', '.join(installed_models) if installed_models else '(none)'}")
+    logger.info("Ollama endpoint: %s", config["url"])
+    logger.info("Primary model: %s", PRIMARY_MODEL)
+    logger.info("Fallback model: %s", FALLBACK_MODEL)
+    logger.info("Context window (num_ctx): %s", config["num_ctx"])
+    logger.info("Inference options: %s", OLLAMA_INFERENCE_OPTIONS)
+    logger.info(
+        "Installed models: %s",
+        ", ".join(installed_models) if installed_models else "(none)",
+    )
 
     _require_installed_model(PRIMARY_MODEL, installed_models, "Primary")
     _require_installed_model(FALLBACK_MODEL, installed_models, "Fallback")
 
     if not config["warmup"]:
-        print("Ollama warmup skipped.")
+        logger.info("Ollama warmup skipped.")
         return
 
-    print(f"Warming up primary model '{PRIMARY_MODEL}' (first load can take a minute)...")
+    logger.info(
+        "Warming up primary model '%s' (first load can take a minute)...",
+        PRIMARY_MODEL,
+    )
     warmup_text = call_ollama_chat(
         PRIMARY_MODEL,
         [{"role": "user", "content": 'Reply with exactly {"ok": true}'}],
         response_format=EXTRACTION_JSON_SCHEMA if config["json_mode"] else None,
     )
-    print(f"Ollama warmup succeeded: {warmup_text[:120]}")
+    logger.info("Ollama warmup succeeded: %s", warmup_text[:120])

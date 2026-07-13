@@ -1,10 +1,20 @@
 import base64
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import tomllib
 from supabase import Client, create_client
+
+
+class ValidationError(Exception):
+    """Raised when LLM extraction JSON fails schema verification."""
+
+    def __init__(self, message: str, cause: Exception | None = None):
+        super().__init__(message)
+        self.cause = cause
 
 
 def get_supabase_key_role(key: str) -> str:
@@ -17,7 +27,7 @@ def get_supabase_key_role(key: str) -> str:
         return "unknown"
 
 
-def load_supabase_credentials():
+def load_supabase_credentials() -> tuple[str, str]:
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_KEY")
 
@@ -38,9 +48,36 @@ def load_supabase_credentials():
     return url, key
 
 
-SUPABASE_URL, SUPABASE_KEY = load_supabase_credentials()
-SUPABASE_KEY_ROLE = get_supabase_key_role(SUPABASE_KEY)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+@lru_cache(maxsize=1)
+def get_supabase() -> Client:
+    """Lazy Supabase client — avoids network/credential import-time side effects."""
+    url, key = load_supabase_credentials()
+    return create_client(url, key)
+
+
+def get_supabase_url() -> str:
+    url, _ = load_supabase_credentials()
+    return url
+
+
+def get_supabase_key_role_cached() -> str:
+    _, key = load_supabase_credentials()
+    return get_supabase_key_role(key)
+
+
+# Backwards-compatible aliases (resolved on first attribute access via __getattr__).
+def __getattr__(name: str) -> Any:
+    if name == "supabase":
+        return get_supabase()
+    if name == "SUPABASE_URL":
+        return get_supabase_url()
+    if name == "SUPABASE_KEY":
+        _, key = load_supabase_credentials()
+        return key
+    if name == "SUPABASE_KEY_ROLE":
+        return get_supabase_key_role_cached()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 PRIMARY_MODEL = os.getenv("OLLAMA_PRIMARY_MODEL", "qwen3-vl:8b-thinking")
 FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5vl:3b")
@@ -49,9 +86,14 @@ PIPELINE_STATUS_COMPLETED = "COMPLETED"
 PIPELINE_STATUS_FAILED = "FAILED"
 VERIFICATION_STORAGE_BUCKET = "verification_queue"
 
-EXTRACTION_JSON_SCHEMA = {
+# Strict contract for LLM extraction payloads before any DB write.
+EXTRACTION_JSON_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
+        "patient_name": {"type": "string", "minLength": 1},
+        "dob": {"type": "string", "minLength": 1},
+        "form_type": {"type": "string", "minLength": 1},
         "extracted_payload": {
             "type": "object",
             "properties": {
@@ -60,9 +102,11 @@ EXTRACTION_JSON_SCHEMA = {
                 "summary": {"type": "string"},
             },
             "required": ["full_text", "fields", "summary"],
-        }
+            "additionalProperties": True,
+        },
     },
-    "required": ["extracted_payload"],
+    "required": ["patient_name", "dob", "form_type", "extracted_payload"],
+    "additionalProperties": False,
 }
 
 OLLAMA_INFERENCE_OPTIONS = {
@@ -71,7 +115,7 @@ OLLAMA_INFERENCE_OPTIONS = {
 }
 
 
-def get_ollama_config():
+def get_ollama_config() -> dict[str, Any]:
     return {
         "url": os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/"),
         "timeout": int(os.getenv("OLLAMA_TIMEOUT", "300")),
