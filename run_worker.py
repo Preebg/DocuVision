@@ -1,0 +1,117 @@
+"""On-prem composition root — poll local incoming dir, run DocumentPipeline.
+
+Usage (from laptop, targeting Mini PC Ollama)::
+
+    set DOCUVISION_DATA_ROOT=C:\\data\\docuvision
+    set DOCUVISION_OLLAMA_BASE_URL=http://192.168.1.50:11434
+    python run_worker.py
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+import time
+
+from docuvision.adapters.local_storage import LocalStorageAdapter
+from docuvision.adapters.ollama_client import OllamaVisionClient
+from docuvision.adapters.sqlite_repository import SqlitePipelineRepository
+from docuvision.config.settings import Settings, get_settings
+from docuvision.core.pipeline import DocumentPipeline
+from docuvision.stages.layout import DoclingLayoutStage
+from docuvision.stages.vision_extraction import VisionExtractionStage
+
+logger = logging.getLogger("docuvision.worker")
+
+
+def build_pipeline(
+    settings: Settings,
+    *,
+    ollama: OllamaVisionClient | None = None,
+) -> DocumentPipeline:
+    """Wire concrete adapters into the Protocol-only orchestrator."""
+    settings.ensure_directories()
+
+    storage = LocalStorageAdapter(settings)
+    repository = SqlitePipelineRepository(settings.resolved_sqlite_path())
+    layout = DoclingLayoutStage()
+    vision_client = ollama or OllamaVisionClient(settings)
+    vision = VisionExtractionStage(vision_client)
+
+    return DocumentPipeline(
+        storage=storage,
+        repository=repository,
+        layout=layout,
+        vision=vision,
+    )
+
+
+def run_poll_loop(pipeline: DocumentPipeline, settings: Settings) -> None:
+    interval = settings.watcher_poll_interval_seconds
+    logger.info(
+        "worker.poll_loop started interval_seconds=%s incoming=%s",
+        interval,
+        settings.resolved_incoming_dir(),
+    )
+
+    while True:
+        try:
+            result = pipeline.process_next()
+            if result is None:
+                time.sleep(interval)
+                continue
+
+            if result.success:
+                logger.info(
+                    "worker.job_ok job_id=%s file=%s status=%s",
+                    result.job_id,
+                    result.file_name,
+                    result.status.value,
+                )
+            else:
+                logger.error(
+                    "worker.job_failed job_id=%s file=%s error=%s",
+                    result.job_id,
+                    result.file_name,
+                    result.error_message,
+                )
+        except KeyboardInterrupt:
+            logger.info("worker.shutdown requested")
+            raise
+        except Exception:
+            logger.exception("worker.poll_error")
+            time.sleep(interval)
+
+
+def main(argv: list[str] | None = None) -> int:
+    _ = argv  # reserved for future CLI flags
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+    settings = get_settings()
+    logger.info("=== DocuVision on-prem worker ===")
+    logger.info("data_root=%s", settings.data_root)
+    logger.info("incoming=%s", settings.resolved_incoming_dir())
+    logger.info("processed=%s", settings.resolved_processed_dir())
+    logger.info("failed=%s", settings.resolved_failed_dir())
+    logger.info("verification=%s", settings.resolved_verification_dir())
+    logger.info("sqlite=%s", settings.resolved_sqlite_path())
+    logger.info("ollama_base_url=%s", settings.ollama_base_url)
+
+    settings.ensure_directories()
+    ollama = OllamaVisionClient(settings)
+    ollama.validate_access()
+
+    pipeline = build_pipeline(settings, ollama=ollama)
+    try:
+        run_poll_loop(pipeline, settings)
+    except KeyboardInterrupt:
+        logger.info("worker stopped")
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,336 @@
+"""Network-pluggable Ollama client targeting a LAN Mini PC endpoint."""
+
+from __future__ import annotations
+
+import base64
+import io
+import logging
+from pathlib import Path
+from typing import Any
+
+import requests
+
+from docuvision.config.settings import Settings
+from docuvision.extraction_schema import (
+    EXTRACTION_JSON_SCHEMA,
+    parse_json_response,
+)
+
+logger = logging.getLogger(__name__)
+
+OLLAMA_INFERENCE_OPTIONS = {
+    "temperature": 0.0,
+    "top_p": 0.1,
+}
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover
+    Image = None  # type: ignore[misc, assignment]
+
+
+class ModelRecoverableError(RuntimeError):
+    """Primary vision model failed due to OOM, timeout, or system crash."""
+
+
+class OllamaVisionClient:
+    """``VisionLLMClient`` backed by HTTP calls to ``DOCUVISION_OLLAMA_BASE_URL``.
+
+    The worker laptop posts to the Mini PC; no local GPU is required here.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._base_url = settings.ollama_base_url.rstrip("/")
+        self._timeout = settings.ollama_timeout_seconds
+        self._num_ctx = settings.ollama_num_ctx
+        self._image_max_dimension = settings.ollama_image_max_dimension
+        self._pdf_max_pages = settings.ollama_pdf_max_pages
+        self._json_mode = settings.ollama_json_mode
+        self._layout_max_chars = settings.layout_max_chars
+        self._primary_model = settings.ollama_primary_model
+        self._fallback_model = settings.ollama_fallback_model
+        self._warmup = settings.ollama_warmup
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    @property
+    def primary_model(self) -> str:
+        return self._primary_model
+
+    @property
+    def fallback_model(self) -> str:
+        return self._fallback_model
+
+    def extract_fields(
+        self,
+        local_path: str,
+        layout_markdown: str,
+        *,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """POST images + layout markdown to Mini PC ``/api/chat``; return parsed JSON."""
+        chosen_model = model or self._primary_model
+        messages = self.build_vision_messages(local_path, layout_markdown)
+        response_format = EXTRACTION_JSON_SCHEMA if self._json_mode else None
+        ai_text = self.chat(chosen_model, messages, response_format=response_format)
+        return parse_json_response(ai_text)
+
+    def chat(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "num_ctx": self._num_ctx,
+                **OLLAMA_INFERENCE_OPTIONS,
+            },
+        }
+        if response_format is not None:
+            payload["format"] = response_format
+
+        url = f"{self._base_url}/api/chat"
+        try:
+            response = requests.post(url, json=payload, timeout=self._timeout)
+        except requests.RequestException as exc:
+            if self.is_recoverable_failure(exc):
+                raise ModelRecoverableError(
+                    f"Model '{model}' request failed: {exc}"
+                ) from exc
+            raise RuntimeError(
+                f"Could not reach Ollama at {self._base_url}. "
+                "Confirm the Mini PC is online and Ollama is listening on :11434."
+            ) from exc
+
+        try:
+            response_data = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Ollama returned a non-JSON response (HTTP {response.status_code}): "
+                f"{response.text[:500]}"
+            ) from exc
+
+        if response.status_code != 200:
+            error_message = response_data.get("error") or response_data
+            wrapped = RuntimeError(
+                f"Ollama request failed (HTTP {response.status_code}) for model "
+                f"'{model}': {error_message}"
+            )
+            if self.is_recoverable_failure(wrapped):
+                raise ModelRecoverableError(str(wrapped)) from wrapped
+            raise wrapped
+
+        if "error" in response_data:
+            wrapped = RuntimeError(
+                f"Ollama error for model '{model}': {response_data['error']}"
+            )
+            if self.is_recoverable_failure(wrapped):
+                raise ModelRecoverableError(str(wrapped)) from wrapped
+            raise wrapped
+
+        message = response_data.get("message")
+        if not message or "content" not in message:
+            raise RuntimeError(
+                "Ollama returned an unexpected response shape. "
+                f"Response keys: {list(response_data.keys())}."
+            )
+        return message["content"]
+
+    def list_models(self) -> list[str]:
+        try:
+            response = requests.get(f"{self._base_url}/api/tags", timeout=10)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Could not reach Ollama at {self._base_url}. "
+                "Confirm the Mini PC IP and that `ollama serve` is running."
+            ) from exc
+        payload = response.json()
+        return [model["name"] for model in payload.get("models", [])]
+
+    def validate_access(self) -> None:
+        installed = self.list_models()
+        logger.info("ollama.endpoint=%s", self._base_url)
+        logger.info("ollama.primary_model=%s", self._primary_model)
+        logger.info("ollama.fallback_model=%s", self._fallback_model)
+        logger.info(
+            "ollama.installed=%s",
+            ", ".join(installed) if installed else "(none)",
+        )
+        self._require_model(self._primary_model, installed, "Primary")
+        self._require_model(self._fallback_model, installed, "Fallback")
+
+        if not self._warmup:
+            logger.info("ollama.warmup skipped")
+            return
+
+        logger.info("ollama.warmup starting model=%s", self._primary_model)
+        text = self.chat(
+            self._primary_model,
+            [{"role": "user", "content": 'Reply with exactly {"ok": true}'}],
+            response_format=EXTRACTION_JSON_SCHEMA if self._json_mode else None,
+        )
+        logger.info("ollama.warmup ok snippet=%s", text[:120])
+
+    def build_vision_messages(
+        self, local_path: str, layout_markdown: str
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are a document OCR and extraction engine. "
+                    "Read the attached page image(s) and bundled layout text. "
+                    "Return only valid JSON matching the required schema."
+                ),
+            },
+            {
+                "role": "user",
+                "content": self._bundle_layout_prompt(layout_markdown),
+                "images": self.encode_images_base64(local_path),
+            },
+        ]
+
+    def encode_images_base64(self, file_path: str) -> list[str]:
+        encoded: list[str] = []
+        for image_bytes, size_label in self._prepare_images(file_path):
+            logger.info(
+                "ollama.image prepared label=%s bytes=%s",
+                size_label,
+                len(image_bytes),
+            )
+            encoded.append(base64.b64encode(image_bytes).decode("utf-8"))
+        return encoded
+
+    def _bundle_layout_prompt(self, markdown_layout: str) -> str:
+        layout_text = markdown_layout.strip()
+        if len(layout_text) > self._layout_max_chars:
+            layout_text = layout_text[: self._layout_max_chars] + "\n...[truncated]"
+
+        return (
+            "You are given a document page image payload and its Docling structural "
+            "markdown layout.\n"
+            "Use BOTH the attached image(s) and the bundled layout text together.\n"
+            "Return JSON only that strictly matches the required schema:\n"
+            '{"patient_name":"...","dob":"...","form_type":"...",'
+            '"extracted_payload":{"full_text":"...","fields":{},"summary":"..."}}\n'
+            "patient_name, dob, and form_type are mandatory non-empty strings.\n"
+            "Put every readable word into full_text. Do not leave it empty.\n\n"
+            "Bundled Docling structural markdown layout:\n"
+            f"{layout_text if layout_text else '(no layout text extracted)'}"
+        )
+
+    def _prepare_images(self, file_path: str) -> list[tuple[bytes, str]]:
+        path = Path(file_path)
+        if path.suffix.lower() == ".pdf":
+            return self._render_pdf_pages(file_path)
+
+        if Image is None:
+            with open(file_path, "rb") as handle:
+                return [(handle.read(), "original")]
+
+        with Image.open(file_path) as image:
+            image = image.convert("RGB")
+            width, height = image.size
+            max_dim = self._image_max_dimension
+
+            if max(width, height) > max_dim:
+                scale = max_dim / max(width, height)
+                resized = (max(1, int(width * scale)), max(1, int(height * scale)))
+                image = image.resize(resized, Image.Resampling.LANCZOS)
+                size_label = f"{width}x{height} -> {resized[0]}x{resized[1]}"
+            else:
+                size_label = f"{width}x{height}"
+
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=85, optimize=True)
+            return [(buffer.getvalue(), size_label)]
+
+    def _render_pdf_pages(self, pdf_path: str) -> list[tuple[bytes, str]]:
+        try:
+            import fitz
+        except ImportError as exc:
+            raise RuntimeError(
+                "PDF support requires PyMuPDF. Install with: pip install pymupdf"
+            ) from exc
+
+        rendered: list[tuple[bytes, str]] = []
+        with fitz.open(pdf_path) as doc:
+            page_count = len(doc)
+            pages_to_render = min(page_count, self._pdf_max_pages)
+            if page_count > self._pdf_max_pages:
+                logger.info(
+                    "ollama.pdf truncated pages=%s max=%s",
+                    page_count,
+                    self._pdf_max_pages,
+                )
+
+            for page_index in range(pages_to_render):
+                page = doc[page_index]
+                rect = page.rect
+                if rect.width <= 0 or rect.height <= 0:
+                    continue
+
+                scale = min(
+                    self._image_max_dimension / rect.width,
+                    self._image_max_dimension / rect.height,
+                    2.0,
+                )
+                scale = max(scale, 0.1)
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                label = (
+                    f"pdf page {page_index + 1}/{page_count} "
+                    f"({pixmap.width}x{pixmap.height})"
+                )
+                rendered.append((pixmap.tobytes("jpeg"), label))
+
+        if not rendered:
+            raise RuntimeError("PDF did not contain any renderable pages.")
+        return rendered
+
+    @staticmethod
+    def is_recoverable_failure(exc: BaseException) -> bool:
+        if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            return True
+        message = str(exc).lower()
+        markers = (
+            "out of memory",
+            "oom",
+            "cuda",
+            "vram",
+            "memory",
+            "timeout",
+            "timed out",
+            "resource exhausted",
+            "model runner has terminated",
+            "crashed",
+            "killed",
+            "500 internal server error",
+            "server error",
+        )
+        return any(marker in message for marker in markers)
+
+    @staticmethod
+    def _require_model(model_name: str, installed: list[str], label: str) -> None:
+        if model_name in installed:
+            return
+        suggestion = next(
+            (
+                candidate
+                for candidate in installed
+                if model_name.lower() in candidate.lower()
+                or candidate.lower() in model_name.lower()
+            ),
+            installed[0] if installed else None,
+        )
+        hint = f"\nTry instead: {suggestion}" if suggestion else ""
+        raise SystemExit(
+            f"{label} model '{model_name}' is not installed on the Mini PC.{hint}\n"
+            f"Run on the Mini PC: ollama pull {model_name}"
+        )
