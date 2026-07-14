@@ -8,8 +8,11 @@ import traceback
 from pathlib import Path
 
 from config import (
+    INCOMING_STORAGE_BUCKET,
     PIPELINE_STATUS_FAILED,
+    PIPELINE_STATUS_IMPORTED,
     PIPELINE_STATUS_PENDING_VERIFICATION,
+    PIPELINE_STATUS_SCANNING,
     VERIFICATION_STORAGE_BUCKET,
     get_supabase,
     get_supabase_key_role_cached,
@@ -28,9 +31,11 @@ from temp_files import create_ingestion_temp_file, safe_remove
 
 logger = get_logger(__name__)
 
+ACTIVE_INTAKE_STATUSES = (PIPELINE_STATUS_IMPORTED, PIPELINE_STATUS_SCANNING)
+
 
 def list_incoming_form_files():
-    return get_supabase().storage.from_("incoming_forms").list()
+    return get_supabase().storage.from_(INCOMING_STORAGE_BUCKET).list()
 
 
 def is_processable_upload(file_entry):
@@ -79,7 +84,9 @@ def validate_supabase_access():
 def download_incoming_file(file_name: str, local_temp_path: str) -> None:
     logger.info("Downloading form from secure storage queue...")
     with open(local_temp_path, "wb") as file_handle:
-        response = get_supabase().storage.from_("incoming_forms").download(file_name)
+        response = (
+            get_supabase().storage.from_(INCOMING_STORAGE_BUCKET).download(file_name)
+        )
         file_handle.write(response)
 
 
@@ -97,21 +104,76 @@ def stage_file_for_verification(file_name: str, local_temp_path: str) -> None:
         )
 
 
-def record_pipeline_success(file_name: str, parsed_json: dict) -> None:
-    logger.info("STEP 4: Storing successful extraction in document_pipeline...")
-    get_supabase().table("document_pipeline").insert(
-        {
-            "file_name": file_name,
-            "extracted_payload": parsed_json,
-            "status": PIPELINE_STATUS_PENDING_VERIFICATION,
-            "storage_bucket": VERIFICATION_STORAGE_BUCKET,
-            "error_message": None,
-        }
-    ).execute()
+def ensure_imported_job(file_name: str) -> int:
+    """Reuse a UI-created IMPORTED/SCANNING row, or create one for watcher-only ingress."""
+    existing = (
+        get_supabase()
+        .table("document_pipeline")
+        .select("id,status")
+        .eq("file_name", file_name)
+        .in_("status", list(ACTIVE_INTAKE_STATUSES))
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if existing.data:
+        job_id = int(existing.data[0]["id"])
+        logger.info("Reusing pipeline job id=%s for %s", job_id, file_name)
+        return job_id
+
+    logger.info("Recording IMPORTED status for %s", file_name)
+    created = (
+        get_supabase()
+        .table("document_pipeline")
+        .insert(
+            {
+                "file_name": file_name,
+                "status": PIPELINE_STATUS_IMPORTED,
+                "storage_bucket": INCOMING_STORAGE_BUCKET,
+                "error_message": None,
+            }
+        )
+        .execute()
+    )
+    return int(created.data[0]["id"])
 
 
-def record_pipeline_failure(file_name: str, error_log: str) -> None:
-    logger.info("STEP 4: Marking document_pipeline row as FAILED...")
+def update_pipeline_status(job_id: int, status: str, **fields) -> None:
+    payload = {"status": status, **fields}
+    get_supabase().table("document_pipeline").update(payload).eq("id", job_id).execute()
+
+
+def mark_pipeline_scanning(job_id: int) -> None:
+    logger.info("Pipeline job id=%s -> SCANNING", job_id)
+    update_pipeline_status(job_id, PIPELINE_STATUS_SCANNING)
+
+
+def record_pipeline_success(job_id: int, file_name: str, parsed_json: dict) -> None:
+    logger.info(
+        "STEP 4: Storing successful extraction for job id=%s (%s)...",
+        job_id,
+        file_name,
+    )
+    update_pipeline_status(
+        job_id,
+        PIPELINE_STATUS_PENDING_VERIFICATION,
+        extracted_payload=parsed_json,
+        storage_bucket=VERIFICATION_STORAGE_BUCKET,
+        error_message=None,
+    )
+
+
+def record_pipeline_failure(job_id: int | None, file_name: str, error_log: str) -> None:
+    logger.info("STEP 4: Marking document_pipeline row as FAILED for %s...", file_name)
+    if job_id is not None:
+        update_pipeline_status(
+            job_id,
+            PIPELINE_STATUS_FAILED,
+            error_message=error_log,
+        )
+        return
+
     get_supabase().table("document_pipeline").insert(
         {
             "file_name": file_name,
@@ -122,7 +184,7 @@ def record_pipeline_failure(file_name: str, error_log: str) -> None:
 
 
 def remove_processed_file(file_name: str) -> None:
-    get_supabase().storage.from_("incoming_forms").remove([file_name])
+    get_supabase().storage.from_(INCOMING_STORAGE_BUCKET).remove([file_name])
 
 
 async def process_document(file_name: str) -> None:
@@ -131,10 +193,14 @@ async def process_document(file_name: str) -> None:
 
     local_temp_path: str | None = None
     pipeline_succeeded = False
+    job_id: int | None = None
 
     logger.info("[NEW CAPTURE] Processing document: %s", file_name)
 
     try:
+        job_id = await asyncio.to_thread(ensure_imported_job, file_name)
+        await asyncio.to_thread(mark_pipeline_scanning, job_id)
+
         local_temp_path = create_ingestion_temp_file(file_name)
         await asyncio.to_thread(download_incoming_file, file_name, local_temp_path)
         markdown_layout = await asyncio.to_thread(step1_extract_layout, local_temp_path)
@@ -146,7 +212,9 @@ async def process_document(file_name: str) -> None:
         await asyncio.to_thread(
             stage_file_for_verification, file_name, local_temp_path
         )
-        await asyncio.to_thread(record_pipeline_success, file_name, parsed_json)
+        await asyncio.to_thread(
+            record_pipeline_success, job_id, file_name, parsed_json
+        )
 
         pipeline_succeeded = True
         logger.info(
@@ -166,7 +234,9 @@ async def process_document(file_name: str) -> None:
         )
 
         try:
-            await asyncio.to_thread(record_pipeline_failure, file_name, error_log)
+            await asyncio.to_thread(
+                record_pipeline_failure, job_id, file_name, error_log
+            )
             logger.info(
                 "[STATE] document_pipeline status set to FAILED for %s.",
                 file_name,
@@ -193,16 +263,17 @@ async def process_document(file_name: str) -> None:
         reset_correlation_id()
 
 
-async def poll_and_process_one() -> None:
+async def poll_and_process_one() -> bool:
+    """Process one queued intake file. Returns True when work was found."""
     try:
         files = await asyncio.to_thread(list_incoming_form_files)
     except Exception as exc:
         logger.error("Connection error to Supabase: %s", exc)
-        return
+        return False
 
     uploads = [file_entry for file_entry in files if is_processable_upload(file_entry)]
     if not uploads:
-        return
+        return False
 
     queued_count = len(uploads)
     next_file = uploads[0]["name"]
@@ -212,13 +283,15 @@ async def poll_and_process_one() -> None:
         next_file,
     )
     await process_document(next_file)
+    return True
 
 
 async def run_watcher() -> None:
-    poll_interval = int(os.getenv("WATCHER_POLL_INTERVAL", "3"))
+    poll_interval = int(os.getenv("WATCHER_POLL_INTERVAL", "1"))
     while True:
-        await poll_and_process_one()
-        await asyncio.sleep(poll_interval)
+        had_work = await poll_and_process_one()
+        if not had_work:
+            await asyncio.sleep(poll_interval)
 
 
 def main() -> None:

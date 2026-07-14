@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     Environment variables use the ``DOCUVISION_`` prefix, e.g.:
 
         DOCUVISION_DATA_ROOT=/data
-        DOCUVISION_OLLAMA_BASE_URL=http://192.168.1.50:11434
+        DOCUVISION_OLLAMA_BASE_URL=http://192.168.1.150:11434
     """
 
     model_config = SettingsConfigDict(

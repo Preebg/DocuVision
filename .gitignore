@@ -32,3 +32,6 @@ yarn-error.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# Local Docker / on-prem data volume
+/data/

@@ -207,6 +207,8 @@ async def test_process_document_does_not_call_live_networks():
             "watcher.step2_and_3_vision_extraction",
             return_value=mocked_payload,
         ) as mock_vision,
+        patch("watcher.ensure_imported_job", return_value=42) as mock_import,
+        patch("watcher.mark_pipeline_scanning") as mock_scanning,
         patch("watcher.stage_file_for_verification") as mock_stage,
         patch("watcher.record_pipeline_success") as mock_success,
         patch("watcher.remove_processed_file") as mock_remove,
@@ -220,11 +222,13 @@ async def test_process_document_does_not_call_live_networks():
 
         await process_document("intake_jane.pdf")
 
+        mock_import.assert_called_once_with("intake_jane.pdf")
+        mock_scanning.assert_called_once_with(42)
         mock_download.assert_called_once()
         mock_layout.assert_called_once()
         mock_vision.assert_called_once()
         mock_stage.assert_called_once()
-        mock_success.assert_called_once_with("intake_jane.pdf", mocked_payload)
+        mock_success.assert_called_once_with(42, "intake_jane.pdf", mocked_payload)
         mock_remove.assert_called_once_with("intake_jane.pdf")
 
 
@@ -244,6 +248,8 @@ async def test_process_document_cleans_temp_file_on_pipeline_crash():
             "watcher.step1_extract_layout",
             side_effect=RuntimeError("Docling exploded"),
         ),
+        patch("watcher.ensure_imported_job", return_value=7),
+        patch("watcher.mark_pipeline_scanning"),
         patch("watcher.record_pipeline_failure") as mock_failure,
         patch("watcher.record_pipeline_success") as mock_success,
         patch("watcher.remove_processed_file") as mock_remove,
@@ -253,6 +259,7 @@ async def test_process_document_cleans_temp_file_on_pipeline_crash():
         await process_document("broken.pdf")
 
         mock_failure.assert_called_once()
+        assert mock_failure.call_args.args[0] == 7
         mock_success.assert_not_called()
         mock_remove.assert_not_called()
 

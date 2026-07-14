@@ -1,4 +1,6 @@
 export type PipelineStatus =
+  | "IMPORTED"
+  | "SCANNING"
   | "PENDING_VERIFICATION"
   | "VERIFIED"
   | "FAILED"
@@ -42,6 +44,31 @@ export type VerificationFieldKey = (typeof VERIFICATION_FIELD_KEYS)[number];
 
 export const VERIFIED_BY = "Web_Operator_V1";
 export const DEFAULT_STORAGE_BUCKET = "verification_queue";
+export const INCOMING_STORAGE_BUCKET = "incoming_forms";
+
+export const QUEUE_STATUSES: PipelineStatus[] = [
+  "IMPORTED",
+  "SCANNING",
+  "PENDING_VERIFICATION",
+];
+
+export const PIPELINE_PHASES = [
+  {
+    status: "IMPORTED" as const,
+    label: "Imported",
+    description: "File landed in intake storage",
+  },
+  {
+    status: "SCANNING" as const,
+    label: "Scanning",
+    description: "Layout + vision extraction running",
+  },
+  {
+    status: "PENDING_VERIFICATION" as const,
+    label: "Data Retrieved",
+    description: "Ready for human verification",
+  },
+] as const;
 
 export function normalizeExtractedPayload(
   raw: ExtractedPayload | null | undefined,
@@ -93,4 +120,13 @@ export function buildVerifiedPayload(
 
 export function isPdfFileName(fileName: string | null | undefined): boolean {
   return Boolean(fileName?.toLowerCase().endsWith(".pdf"));
+}
+
+export function phaseIndexForStatus(status: PipelineStatus | null | undefined): number {
+  if (!status) {
+    return -1;
+  }
+
+  const index = PIPELINE_PHASES.findIndex((phase) => phase.status === status);
+  return index;
 }

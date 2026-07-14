@@ -1,0 +1,52 @@
+# DocuVision local stack
+#
+# Worker (pipeline):  docker compose up --build worker
+# Full stack:         docker compose up --build
+# With local Ollama:  docker compose --profile ollama up --build
+#
+# Drop PDFs/images into ./data/incoming — the worker polls that folder.
+# Point DOCUVISION_OLLAMA_BASE_URL at your Mini PC or host Ollama.
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./data:/data
+    environment:
+      DOCUVISION_DATA_ROOT: /data
+      DOCUVISION_OLLAMA_BASE_URL: ${DOCUVISION_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      DOCUVISION_OLLAMA_PRIMARY_MODEL: ${DOCUVISION_OLLAMA_PRIMARY_MODEL:-qwen3-vl:8b-thinking}
+      DOCUVISION_OLLAMA_FALLBACK_MODEL: ${DOCUVISION_OLLAMA_FALLBACK_MODEL:-qwen2.5vl:3b}
+      DOCUVISION_OLLAMA_WARMUP: ${DOCUVISION_OLLAMA_WARMUP:-true}
+      DOCUVISION_WATCHER_POLL_INTERVAL_SECONDS: ${DOCUVISION_WATCHER_POLL_INTERVAL_SECONDS:-3}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    environment:
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+    restart: unless-stopped
+
+  ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  ollama_models:

@@ -32,7 +32,9 @@ export function QueueClearState() {
           All operational queues clear. Great job!
         </h2>
         <p className="mt-2 text-sm text-muted">
-          No documents are waiting for human verification.
+          Drop a file above into{" "}
+          <span className="font-mono text-foreground">incoming_forms</span> to
+          start the pipeline.
         </p>
       </div>
     </div>
