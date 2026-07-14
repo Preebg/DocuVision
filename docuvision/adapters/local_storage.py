@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import shutil
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Sequence
 
 from docuvision.config.settings import Settings
 
@@ -109,6 +109,20 @@ class LocalStorageAdapter:
                 shutil.copyfileobj(source, handle)
         logger.info("storage.write_incoming file_name=%s path=%s", destination.name, destination)
         return destination.name
+
+    def write_incoming_batch(
+        self,
+        documents: Sequence[tuple[str, BinaryIO | bytes]],
+    ) -> list[str]:
+        """Write an ordered list of documents into ingress; preserve sequence.
+
+        Returns stored basenames in the same order as ``documents``.
+        """
+        stored: list[str] = []
+        for file_name, source in documents:
+            stored.append(self.write_incoming(file_name, source))
+        logger.info("storage.write_incoming_batch count=%s", len(stored))
+        return stored
 
     def resolve_document_path(
         self,

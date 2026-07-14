@@ -7,9 +7,15 @@ and are wired at composition-root time.
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, BinaryIO, Protocol, Sequence, runtime_checkable
 
-from docuvision.core.models import DocumentJob, PipelineStatus
+from docuvision.core.models import (
+    Batch,
+    BatchSummary,
+    DocumentJob,
+    DocumentPage,
+    PipelineStatus,
+)
 
 
 @runtime_checkable
@@ -45,13 +51,54 @@ class StorageBackend(Protocol):
         """Move a failed document into the dead-letter / failed area."""
         ...
 
+    def write_incoming_batch(
+        self,
+        documents: Sequence[tuple[str, BinaryIO | bytes]],
+    ) -> list[str]:
+        """Write an ordered batch of documents into the ingress directory.
+
+        Each item is ``(original_file_name, bytes_or_stream)``. Returns the
+        stored basenames in the same sequence (may be uniquified on collision).
+        """
+        ...
+
 
 @runtime_checkable
 class PipelineRepository(Protocol):
-    """Durable job tracking and status persistence (e.g. embedded SQLite)."""
+    """Durable job / batch tracking and status persistence."""
 
     def create_job(self, file_name: str) -> DocumentJob:
         """Insert a new job in ``QUEUED`` and return it."""
+        ...
+
+    def create_batch(
+        self,
+        *,
+        name: str,
+        priority: int = 2,
+        source_id: str | None = None,
+        documents: Sequence[tuple[str, int]],
+    ) -> Batch:
+        """Create a batch and link ``(document_id, sequence_no)`` members.
+
+        Documents must already exist (via ``create_job``). Returns the batch
+        with membership ordered by ``sequence_no``.
+        """
+        ...
+
+    def list_pending_batches(self) -> list[BatchSummary]:
+        """Return non-terminal batches for the supervisor queue view.
+
+        Ordered by priority (HIGH first), then ``created_at`` ascending.
+        """
+        ...
+
+    def add_document_pages(
+        self,
+        document_id: str,
+        pages: Sequence[tuple[int, str]],
+    ) -> list[DocumentPage]:
+        """Record page fragments ``(page_no, file_path)`` for a document."""
         ...
 
     def save_job(self, job: DocumentJob) -> DocumentJob:
@@ -82,13 +129,15 @@ class PipelineRepository(Protocol):
         ...
 
     def claim_next_queued(self) -> DocumentJob | None:
-        """Atomically claim the oldest ``QUEUED`` job for extraction.
+        """Atomically claim the next ``QUEUED`` job for extraction.
 
-        Implementations must guarantee that concurrent workers never receive
-        the same document: PostgreSQL uses ``SELECT … FOR UPDATE SKIP LOCKED``;
-        SQLite uses an immediate-transaction compare-and-set update.
-        Returns the claimed job already transitioned to ``SCANNING``, or
-        ``None`` when the queue is empty.
+        Prefer documents belonging to HIGH-priority batches first, then by
+        ``created_at``. Standalone (non-batch) documents use default medium
+        priority. Implementations must guarantee concurrent workers never
+        receive the same document: PostgreSQL uses
+        ``SELECT … FOR UPDATE SKIP LOCKED``; SQLite uses an immediate-transaction
+        compare-and-set update. Returns the claimed job already transitioned
+        to ``SCANNING``, or ``None`` when the queue is empty.
         """
         ...
 

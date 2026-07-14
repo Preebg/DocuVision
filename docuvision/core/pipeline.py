@@ -127,7 +127,8 @@ class DocumentPipeline:
         """Enroll ingress files, claim one ``QUEUED`` job, then run ``process``.
 
         Concurrent workers are safe: ``claim_next_queued`` uses
-        ``FOR UPDATE SKIP LOCKED`` (Postgres) or an immediate CAS (SQLite).
+        ``FOR UPDATE SKIP LOCKED`` (Postgres) or an immediate CAS (SQLite),
+        preferring documents in HIGH-priority batches.
         """
         for file_name in self._storage.list_incoming():
             self._repository.create_job(file_name)

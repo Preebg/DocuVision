@@ -51,6 +51,37 @@ class IngestResponse(BaseModel):
     status: str
 
 
+class BatchDocumentOut(BaseModel):
+    document_id: str
+    sequence_no: int
+    file_name: str | None = None
+    status: str | None = None
+
+
+class BatchIngestResponse(BaseModel):
+    id: str
+    name: str
+    priority: int
+    status: str
+    source_id: str | None = None
+    documents: list[BatchDocumentOut] = Field(default_factory=list)
+
+
+class BatchPendingOut(BaseModel):
+    id: str
+    name: str
+    priority: int
+    status: str
+    source_id: str | None = None
+    document_count: int
+    created_at: str
+    updated_at: str
+
+
+class BatchPendingResponse(BaseModel):
+    batches: list[BatchPendingOut] = Field(default_factory=list)
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     repository: str

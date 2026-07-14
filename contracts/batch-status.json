@@ -1,0 +1,14 @@
+{
+  "STATUSES": {
+    "INGESTED": "ingested",
+    "PROCESSING": "processing",
+    "READY_FOR_HITL": "ready_for_hitl",
+    "COMPLETED": "completed",
+    "FAILED": "failed"
+  },
+  "PRIORITIES": {
+    "LOW": 1,
+    "MED": 2,
+    "HIGH": 3
+  }
+}

@@ -1,6 +1,6 @@
 """Embedded SQLite ``PipelineRepository`` for on-prem job state.
 
-Schema source of truth: ``migrations/001_documents_pipeline_events.sql``.
+Schema source of truth: ``migrations/*.sql`` (applied in lexical order).
 Operational fields (local_path, layout, payload, errors, updated_at) are
 persisted inside the ``documents.metadata`` JSON document so the physical
 columns stay aligned with the dual-engine migration contract.
@@ -13,18 +13,23 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from uuid import uuid4
 
-from docuvision.core.models import DocumentJob, PipelineStatus
+from docuvision.adapters.schema import load_migration_scripts
+from docuvision.core.models import (
+    DEFAULT_BATCH_PRIORITY,
+    PENDING_BATCH_STATUSES,
+    Batch,
+    BatchDocumentLink,
+    BatchStatus,
+    BatchSummary,
+    DocumentJob,
+    DocumentPage,
+    PipelineStatus,
+)
 
 logger = logging.getLogger(__name__)
-
-_MIGRATION_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "migrations"
-    / "001_documents_pipeline_events.sql"
-)
 
 # Reserved metadata keys for operational job fields not in the DDL columns.
 _META_LOCAL_PATH = "local_path"
@@ -75,10 +80,11 @@ class SqlitePipelineRepository:
         return connection
 
     def _initialize(self) -> None:
-        migration_sql = _MIGRATION_PATH.read_text(encoding="utf-8")
         connection = self._connect()
         try:
-            connection.executescript(migration_sql)
+            for name, migration_sql in load_migration_scripts():
+                connection.executescript(migration_sql)
+                logger.debug("sqlite.migration applied=%s", name)
             connection.commit()
         finally:
             connection.close()
@@ -125,6 +131,143 @@ class SqlitePipelineRepository:
             )
         logger.info("sqlite.create_job id=%s file_name=%s", job.id, file_name)
         return job
+
+    def create_batch(
+        self,
+        *,
+        name: str,
+        priority: int = DEFAULT_BATCH_PRIORITY,
+        source_id: str | None = None,
+        documents: Sequence[tuple[str, int]],
+    ) -> Batch:
+        """Insert a batch row and ordered ``batch_documents`` membership links."""
+        if not name or not str(name).strip():
+            raise ValueError("create_batch requires a non-empty name.")
+        if priority not in (1, 2, 3):
+            raise ValueError(f"Invalid batch priority: {priority} (expected 1, 2, or 3)")
+        if not documents:
+            raise ValueError("create_batch requires at least one document link.")
+
+        batch = Batch(
+            name=str(name).strip(),
+            priority=priority,
+            status=BatchStatus.INGESTED,
+            source_id=source_id,
+        )
+        now = batch.created_at.isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO batches (
+                    id, name, priority, status, source_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch.id,
+                    batch.name,
+                    batch.priority,
+                    batch.status.value,
+                    batch.source_id,
+                    now,
+                    now,
+                ),
+            )
+            links: list[BatchDocumentLink] = []
+            for document_id, sequence_no in documents:
+                row = connection.execute(
+                    "SELECT id, filename FROM documents WHERE id = ?",
+                    (document_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"Document not found for batch link: {document_id}")
+                connection.execute(
+                    """
+                    INSERT INTO batch_documents (batch_id, document_id, sequence_no)
+                    VALUES (?, ?, ?)
+                    """,
+                    (batch.id, document_id, int(sequence_no)),
+                )
+                links.append(
+                    BatchDocumentLink(
+                        document_id=document_id,
+                        sequence_no=int(sequence_no),
+                        file_name=row["filename"],
+                    )
+                )
+                self._insert_event(
+                    connection,
+                    job_id=document_id,
+                    action="BATCH_LINKED",
+                    from_status=None,
+                    to_status=None,
+                    details={
+                        "batch_id": batch.id,
+                        "batch_name": batch.name,
+                        "sequence_no": int(sequence_no),
+                        "priority": batch.priority,
+                    },
+                )
+        links.sort(key=lambda item: item.sequence_no)
+        batch.documents = links
+        logger.info(
+            "sqlite.create_batch id=%s name=%s priority=%s documents=%s",
+            batch.id,
+            batch.name,
+            batch.priority,
+            len(links),
+        )
+        return batch
+
+    def list_pending_batches(self) -> list[BatchSummary]:
+        status_values = [status.value for status in PENDING_BATCH_STATUSES]
+        placeholders = ",".join("?" for _ in status_values)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    b.id,
+                    b.name,
+                    b.priority,
+                    b.status,
+                    b.source_id,
+                    b.created_at,
+                    b.updated_at,
+                    COUNT(bd.document_id) AS document_count
+                FROM batches b
+                LEFT JOIN batch_documents bd ON bd.batch_id = b.id
+                WHERE b.status IN ({placeholders})
+                GROUP BY b.id
+                ORDER BY b.priority DESC, b.created_at ASC
+                """,
+                status_values,
+            ).fetchall()
+        return [self._row_to_batch_summary(row) for row in rows]
+
+    def add_document_pages(
+        self,
+        document_id: str,
+        pages: Sequence[tuple[int, str]],
+    ) -> list[DocumentPage]:
+        if self.get_job(document_id) is None:
+            raise KeyError(f"Document not found: {document_id}")
+        created: list[DocumentPage] = []
+        with self._connect() as connection:
+            for page_no, file_path in pages:
+                page = DocumentPage(
+                    document_id=document_id,
+                    page_no=int(page_no),
+                    file_path=file_path,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO document_pages (id, document_id, page_no, file_path)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (page.id, page.document_id, page.page_no, page.file_path),
+                )
+                created.append(page)
+        created.sort(key=lambda item: item.page_no)
+        return created
 
     def save_job(self, job: DocumentJob) -> DocumentJob:
         updated = job.model_copy(update={"updated_at": datetime.now(timezone.utc)})
@@ -229,23 +372,31 @@ class SqlitePipelineRepository:
         return self._row_to_job(row)
 
     def claim_next_queued(self) -> DocumentJob | None:
-        """Atomically claim oldest ``QUEUED`` → ``SCANNING`` (SQLite CAS).
+        """Atomically claim highest-priority ``QUEUED`` → ``SCANNING`` (SQLite CAS).
 
         SQLite lacks ``FOR UPDATE SKIP LOCKED``. ``BEGIN IMMEDIATE`` serializes
         writers so concurrent processes cannot pull the same row; the
         ``WHERE status = QUEUED`` compare-and-set rejects lost races.
+        Batch priority (HIGH first) beats older medium/low work.
         """
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT * FROM documents
-                WHERE status = ?
-                ORDER BY created_at ASC
+                SELECT d.*
+                FROM documents d
+                LEFT JOIN (
+                    SELECT bd.document_id, MAX(b.priority) AS priority
+                    FROM batch_documents bd
+                    JOIN batches b ON b.id = bd.batch_id
+                    GROUP BY bd.document_id
+                ) bp ON bp.document_id = d.id
+                WHERE d.status = ?
+                ORDER BY COALESCE(bp.priority, ?) DESC, d.created_at ASC
                 LIMIT 1
                 """,
-                (PipelineStatus.QUEUED.value,),
+                (PipelineStatus.QUEUED.value, DEFAULT_BATCH_PRIORITY),
             ).fetchone()
             if row is None:
                 connection.rollback()
@@ -272,6 +423,7 @@ class SqlitePipelineRepository:
                 connection.rollback()
                 return None
 
+            self._mark_batch_processing(connection, claimed.id)
             self._insert_event(
                 connection,
                 job_id=claimed.id,
@@ -292,6 +444,30 @@ class SqlitePipelineRepository:
             raise
         finally:
             connection.close()
+
+    def _mark_batch_processing(
+        self,
+        connection: sqlite3.Connection,
+        document_id: str,
+    ) -> None:
+        """Flip parent batch(es) from ``ingested`` → ``processing`` on first claim."""
+        now = _utc_iso()
+        connection.execute(
+            """
+            UPDATE batches
+            SET status = ?, updated_at = ?
+            WHERE status = ?
+              AND id IN (
+                  SELECT batch_id FROM batch_documents WHERE document_id = ?
+              )
+            """,
+            (
+                BatchStatus.PROCESSING.value,
+                now,
+                BatchStatus.INGESTED.value,
+                document_id,
+            ),
+        )
 
     def list_by_status(self, status: PipelineStatus) -> list[DocumentJob]:
         return self.list_by_statuses([status])
@@ -423,4 +599,17 @@ class SqlitePipelineRepository:
             updated_at=_parse_dt(updated_raw)
             if isinstance(updated_raw, str)
             else _parse_dt(row["created_at"]),
+        )
+
+    @staticmethod
+    def _row_to_batch_summary(row: sqlite3.Row) -> BatchSummary:
+        return BatchSummary(
+            id=row["id"],
+            name=row["name"],
+            priority=int(row["priority"]),
+            status=BatchStatus(row["status"]),
+            source_id=row["source_id"],
+            document_count=int(row["document_count"] or 0),
+            created_at=_parse_dt(row["created_at"]),
+            updated_at=_parse_dt(row["updated_at"]),
         )

@@ -1,6 +1,6 @@
 """PostgreSQL ``PipelineRepository`` with connection pooling (psycopg).
 
-Schema source of truth: ``migrations/001_documents_pipeline_events.sql``.
+Schema source of truth: ``migrations/*.sql`` (applied in lexical order).
 Operational fields (local_path, layout, payload, errors, updated_at) are
 persisted inside the ``documents.metadata`` JSON document so the physical
 columns stay aligned with the dual-engine migration contract.
@@ -11,22 +11,26 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Sequence
 from uuid import uuid4
 
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from docuvision.core.models import DocumentJob, PipelineStatus
+from docuvision.adapters.schema import load_migration_scripts, split_sql_statements
+from docuvision.core.models import (
+    DEFAULT_BATCH_PRIORITY,
+    PENDING_BATCH_STATUSES,
+    Batch,
+    BatchDocumentLink,
+    BatchStatus,
+    BatchSummary,
+    DocumentJob,
+    DocumentPage,
+    PipelineStatus,
+)
 
 logger = logging.getLogger(__name__)
-
-_MIGRATION_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "migrations"
-    / "001_documents_pipeline_events.sql"
-)
 
 _META_LOCAL_PATH = "local_path"
 _META_LAYOUT = "layout_markdown"
@@ -81,25 +85,11 @@ class PostgresPipelineRepository:
         self._pool.close()
 
     def _initialize(self) -> None:
-        migration_sql = _MIGRATION_PATH.read_text(encoding="utf-8")
-        statements = [
-            part.strip()
-            for part in migration_sql.split(";")
-            if part.strip() and not all(
-                line.strip().startswith("--") or not line.strip()
-                for line in part.strip().splitlines()
-            )
-        ]
         with self._pool.connection() as connection:
-            for statement in statements:
-                # Skip trailing comment-only blocks after the last semicolon.
-                executable = "\n".join(
-                    line
-                    for line in statement.splitlines()
-                    if not line.strip().startswith("--")
-                ).strip()
-                if executable:
-                    connection.execute(executable)
+            for name, migration_sql in load_migration_scripts():
+                for statement in split_sql_statements(migration_sql):
+                    connection.execute(statement)
+                logger.debug("postgres.migration applied=%s", name)
             connection.commit()
         logger.info("postgres.initialized")
 
@@ -145,6 +135,144 @@ class PostgresPipelineRepository:
             connection.commit()
         logger.info("postgres.create_job id=%s file_name=%s", job.id, file_name)
         return job
+
+    def create_batch(
+        self,
+        *,
+        name: str,
+        priority: int = DEFAULT_BATCH_PRIORITY,
+        source_id: str | None = None,
+        documents: Sequence[tuple[str, int]],
+    ) -> Batch:
+        """Insert a batch row and ordered ``batch_documents`` membership links."""
+        if not name or not str(name).strip():
+            raise ValueError("create_batch requires a non-empty name.")
+        if priority not in (1, 2, 3):
+            raise ValueError(f"Invalid batch priority: {priority} (expected 1, 2, or 3)")
+        if not documents:
+            raise ValueError("create_batch requires at least one document link.")
+
+        batch = Batch(
+            name=str(name).strip(),
+            priority=priority,
+            status=BatchStatus.INGESTED,
+            source_id=source_id,
+        )
+        now = batch.created_at.isoformat()
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO batches (
+                    id, name, priority, status, source_id, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    batch.id,
+                    batch.name,
+                    batch.priority,
+                    batch.status.value,
+                    batch.source_id,
+                    now,
+                    now,
+                ),
+            )
+            links: list[BatchDocumentLink] = []
+            for document_id, sequence_no in documents:
+                row = connection.execute(
+                    "SELECT id, filename FROM documents WHERE id = %s",
+                    (document_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"Document not found for batch link: {document_id}")
+                connection.execute(
+                    """
+                    INSERT INTO batch_documents (batch_id, document_id, sequence_no)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (batch.id, document_id, int(sequence_no)),
+                )
+                links.append(
+                    BatchDocumentLink(
+                        document_id=document_id,
+                        sequence_no=int(sequence_no),
+                        file_name=row["filename"],
+                    )
+                )
+                self._insert_event(
+                    connection,
+                    job_id=document_id,
+                    action="BATCH_LINKED",
+                    from_status=None,
+                    to_status=None,
+                    details={
+                        "batch_id": batch.id,
+                        "batch_name": batch.name,
+                        "sequence_no": int(sequence_no),
+                        "priority": batch.priority,
+                    },
+                )
+            connection.commit()
+        links.sort(key=lambda item: item.sequence_no)
+        batch.documents = links
+        logger.info(
+            "postgres.create_batch id=%s name=%s priority=%s documents=%s",
+            batch.id,
+            batch.name,
+            batch.priority,
+            len(links),
+        )
+        return batch
+
+    def list_pending_batches(self) -> list[BatchSummary]:
+        status_values = [status.value for status in PENDING_BATCH_STATUSES]
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    b.id,
+                    b.name,
+                    b.priority,
+                    b.status,
+                    b.source_id,
+                    b.created_at,
+                    b.updated_at,
+                    COUNT(bd.document_id) AS document_count
+                FROM batches b
+                LEFT JOIN batch_documents bd ON bd.batch_id = b.id
+                WHERE b.status = ANY(%s)
+                GROUP BY b.id
+                ORDER BY b.priority DESC, b.created_at ASC
+                """,
+                (status_values,),
+            ).fetchall()
+        return [self._row_to_batch_summary(row) for row in rows]
+
+    def add_document_pages(
+        self,
+        document_id: str,
+        pages: Sequence[tuple[int, str]],
+    ) -> list[DocumentPage]:
+        if self.get_job(document_id) is None:
+            raise KeyError(f"Document not found: {document_id}")
+        created: list[DocumentPage] = []
+        with self._pool.connection() as connection:
+            for page_no, file_path in pages:
+                page = DocumentPage(
+                    document_id=document_id,
+                    page_no=int(page_no),
+                    file_path=file_path,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO document_pages (id, document_id, page_no, file_path)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (page.id, page.document_id, page.page_no, page.file_path),
+                )
+                created.append(page)
+            connection.commit()
+        created.sort(key=lambda item: item.page_no)
+        return created
 
     def save_job(self, job: DocumentJob) -> DocumentJob:
         updated = job.model_copy(update={"updated_at": datetime.now(timezone.utc)})
@@ -251,18 +379,25 @@ class PostgresPipelineRepository:
         return self._row_to_job(row)
 
     def claim_next_queued(self) -> DocumentJob | None:
-        """Claim oldest ``QUEUED`` row via ``FOR UPDATE SKIP LOCKED`` → ``SCANNING``."""
+        """Claim highest-priority ``QUEUED`` via ``FOR UPDATE SKIP LOCKED`` → ``SCANNING``."""
         with self._pool.connection() as connection:
             # Non-blocking row lock: concurrent workers skip already-claimed ids.
+            # Prefer HIGH batch priority; standalone docs use DEFAULT_BATCH_PRIORITY.
             row = connection.execute(
                 """
                 WITH next_job AS (
-                    SELECT id
-                    FROM documents
-                    WHERE status = %s
-                    ORDER BY created_at ASC
+                    SELECT d.id
+                    FROM documents d
+                    LEFT JOIN (
+                        SELECT bd.document_id, MAX(b.priority) AS priority
+                        FROM batch_documents bd
+                        JOIN batches b ON b.id = bd.batch_id
+                        GROUP BY bd.document_id
+                    ) bp ON bp.document_id = d.id
+                    WHERE d.status = %s
+                    ORDER BY COALESCE(bp.priority, %s) DESC, d.created_at ASC
                     LIMIT 1
-                    FOR UPDATE SKIP LOCKED
+                    FOR UPDATE OF d SKIP LOCKED
                 )
                 UPDATE documents AS d
                 SET status = %s
@@ -270,7 +405,11 @@ class PostgresPipelineRepository:
                 WHERE d.id = next_job.id
                 RETURNING d.*
                 """,
-                (PipelineStatus.QUEUED.value, PipelineStatus.SCANNING.value),
+                (
+                    PipelineStatus.QUEUED.value,
+                    DEFAULT_BATCH_PRIORITY,
+                    PipelineStatus.SCANNING.value,
+                ),
             ).fetchone()
             if row is None:
                 connection.commit()
@@ -284,6 +423,7 @@ class PostgresPipelineRepository:
                 "UPDATE documents SET metadata = %s WHERE id = %s",
                 (self._dumps(metadata), stamped.id),
             )
+            self._mark_batch_processing(connection, stamped.id)
             self._insert_event(
                 connection,
                 job_id=stamped.id,
@@ -299,6 +439,25 @@ class PostgresPipelineRepository:
                 stamped.file_name,
             )
             return stamped
+
+    def _mark_batch_processing(self, connection: Any, document_id: str) -> None:
+        """Flip parent batch(es) from ``ingested`` → ``processing`` on first claim."""
+        connection.execute(
+            """
+            UPDATE batches
+            SET status = %s, updated_at = %s
+            WHERE status = %s
+              AND id IN (
+                  SELECT batch_id FROM batch_documents WHERE document_id = %s
+              )
+            """,
+            (
+                BatchStatus.PROCESSING.value,
+                _utc_iso(),
+                BatchStatus.INGESTED.value,
+                document_id,
+            ),
+        )
 
     def list_by_status(self, status: PipelineStatus) -> list[DocumentJob]:
         return self.list_by_statuses([status])
@@ -432,4 +591,17 @@ class PostgresPipelineRepository:
             updated_at=_parse_dt(updated_raw)
             if isinstance(updated_raw, (str, datetime))
             else _parse_dt(row.get("created_at")),
+        )
+
+    @staticmethod
+    def _row_to_batch_summary(row: dict[str, Any]) -> BatchSummary:
+        return BatchSummary(
+            id=row["id"],
+            name=row["name"],
+            priority=int(row["priority"]),
+            status=BatchStatus(row["status"]),
+            source_id=row.get("source_id"),
+            document_count=int(row.get("document_count") or 0),
+            created_at=_parse_dt(row.get("created_at")),
+            updated_at=_parse_dt(row.get("updated_at")),
         )

@@ -101,9 +101,12 @@ def test_migration_creates_documents_and_pipeline_events(tmp_path):
         }
     assert "documents" in tables
     assert "pipeline_events" in tables
+    assert "batches" in tables
+    assert "batch_documents" in tables
+    assert "document_pages" in tables
     assert "idx_pipeline_events_job_id" in indexes
     assert "idx_pipeline_events_created_at" in indexes
-
+    assert "idx_batches_status" in indexes
 
 def test_happy_path_reaches_pending_verification(tmp_path):
     pipeline, repo, storage = _build(tmp_path)

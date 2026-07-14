@@ -15,7 +15,12 @@ from docuvision.core.errors import (
 )
 from docuvision.core.models import (
     PIPELINE_HAPPY_PATH,
+    Batch,
+    BatchPriority,
+    BatchStatus,
+    BatchSummary,
     DocumentJob,
+    DocumentPage,
     JobStatus,
     PipelineResult,
     PipelineStatus,
@@ -35,7 +40,12 @@ StorageError = TransientError
 VisionStageError = FatalProcessingError
 
 __all__ = [
+    "Batch",
+    "BatchPriority",
+    "BatchStatus",
+    "BatchSummary",
     "DocumentJob",
+    "DocumentPage",
     "DocumentPipeline",
     "FatalProcessingError",
     "InfrastructureError",
