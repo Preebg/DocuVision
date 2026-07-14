@@ -1,40 +1,46 @@
-"""Domain types for document jobs and pipeline outcomes."""
+"""Domain types for document jobs and pipeline outcomes.
+
+``PipelineStatus`` is generated at import time from the shared JSON contract
+``contracts/pipeline-status.json`` so Python and TypeScript stay bit-aligned.
+"""
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+_CONTRACT_PATH = (
+    Path(__file__).resolve().parents[2] / "contracts" / "pipeline-status.json"
+)
 
-class JobStatus(str, Enum):
-    """Explicit pipeline state-machine statuses.
 
-    Happy-path transitions:
-        QUEUED → DOWNLOADING → LAYOUT → VISION → STAGING → PENDING_VERIFICATION
-    """
+def _load_pipeline_status_enum() -> type[Enum]:
+    with _CONTRACT_PATH.open(encoding="utf-8") as handle:
+        contract = json.load(handle)
+    stages: dict[str, str] = contract["STAGES"]
+    return Enum("PipelineStatus", stages, type=str)
 
-    QUEUED = "QUEUED"
-    DOWNLOADING = "DOWNLOADING"
-    LAYOUT = "LAYOUT"
-    VISION = "VISION"
-    STAGING = "STAGING"
-    PENDING_VERIFICATION = "PENDING_VERIFICATION"
-    FAILED = "FAILED"
 
+PipelineStatus = _load_pipeline_status_enum()
 
 # Ordered happy-path sequence recorded by the orchestrator.
-PIPELINE_HAPPY_PATH: tuple[JobStatus, ...] = (
-    JobStatus.QUEUED,
-    JobStatus.DOWNLOADING,
-    JobStatus.LAYOUT,
-    JobStatus.VISION,
-    JobStatus.STAGING,
-    JobStatus.PENDING_VERIFICATION,
+PIPELINE_HAPPY_PATH: tuple[PipelineStatus, ...] = (  # type: ignore[valid-type]
+    PipelineStatus.QUEUED,
+    PipelineStatus.SCANNING,
+    PipelineStatus.LAYOUT,
+    PipelineStatus.VISION,
+    PipelineStatus.STAGING,
+    PipelineStatus.PENDING_VERIFICATION,
 )
+
+# Backwards-compatible alias for adapters still importing JobStatus.
+JobStatus = PipelineStatus
 
 
 def _utc_now() -> datetime:
@@ -46,7 +52,7 @@ class DocumentJob(BaseModel):
 
     id: str = Field(default_factory=lambda: str(uuid4()))
     file_name: str
-    status: JobStatus = JobStatus.QUEUED
+    status: PipelineStatus = PipelineStatus.QUEUED  # type: ignore[valid-type]
     local_path: str | None = None
     layout_markdown: str | None = None
     extracted_payload: dict[str, Any] | None = None
@@ -56,7 +62,7 @@ class DocumentJob(BaseModel):
 
     def transition_to(
         self,
-        status: JobStatus,
+        status: PipelineStatus,
         *,
         local_path: str | None = None,
         layout_markdown: str | None = None,
@@ -76,7 +82,7 @@ class DocumentJob(BaseModel):
             updates["extracted_payload"] = extracted_payload
         if error_message is not None:
             updates["error_message"] = error_message
-        elif status != JobStatus.FAILED:
+        elif status != PipelineStatus.FAILED:
             updates["error_message"] = None
         return self.model_copy(update=updates)
 
@@ -87,7 +93,7 @@ class PipelineResult(BaseModel):
     job_id: str
     file_name: str
     success: bool
-    status: JobStatus
+    status: PipelineStatus
     extracted_payload: dict[str, Any] | None = None
     error_message: str | None = None
     correlation_id: str | None = None

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
-from docuvision.core.models import DocumentJob, JobStatus
+from docuvision.core.models import DocumentJob, PipelineStatus
 
 
 @runtime_checkable
@@ -61,7 +61,7 @@ class PipelineRepository(Protocol):
     def update_status(
         self,
         job_id: str,
-        status: JobStatus,
+        status: PipelineStatus,
         *,
         local_path: str | None = None,
         layout_markdown: str | None = None,

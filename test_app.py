@@ -287,3 +287,95 @@ def test_call_ollama_chat_is_mockable_without_network():
         # Ensure we never pointed at a real host in this test path
         called_url = mock_post.call_args.args[0]
         assert called_url.endswith("/api/chat")
+
+
+def test_select_next_intake_file_picks_oldest_imported_fifo():
+    """One device claims IMPORTED rows in created_at order before starting OCR."""
+    from watcher import select_next_intake_file
+
+    supabase = MagicMock()
+    calls = {"n": 0}
+
+    def selective_table(_name: str):
+        chain = MagicMock()
+        chain.select.return_value = chain
+        chain.eq.return_value = chain
+        chain.neq.return_value = chain
+        chain.in_.return_value = chain
+        chain.order.return_value = chain
+        chain.limit.return_value = chain
+        calls["n"] += 1
+        # 1 = ours SCANNING, 2 = other SCANNING, 3 = IMPORTED FIFO
+        if calls["n"] == 3:
+            chain.execute.return_value = MagicMock(
+                data=[
+                    {
+                        "id": 1,
+                        "file_name": "first.pdf",
+                        "created_at": "2026-07-14T12:00:00Z",
+                    },
+                    {
+                        "id": 2,
+                        "file_name": "second.pdf",
+                        "created_at": "2026-07-14T12:01:00Z",
+                    },
+                ]
+            )
+        else:
+            chain.execute.return_value = MagicMock(data=[])
+        return chain
+
+    supabase.table.side_effect = selective_table
+    supabase.storage.from_.return_value.list.return_value = [
+        {"name": "second.pdf", "created_at": "2026-07-14T12:01:00Z"},
+        {"name": "first.pdf", "created_at": "2026-07-14T12:00:00Z"},
+    ]
+
+    with (
+        patch("watcher.get_supabase", return_value=supabase),
+        patch("watcher.get_device_id", return_value="mini-pc-1"),
+        patch("watcher.reclaim_stale_scanning_jobs", return_value=0),
+    ):
+        chosen = select_next_intake_file()
+
+    assert chosen == "first.pdf"
+
+
+def test_select_next_intake_file_waits_when_other_device_is_scanning():
+    from watcher import select_next_intake_file
+
+    supabase = MagicMock()
+    calls = {"n": 0}
+
+    def selective_table(_name: str):
+        chain = MagicMock()
+        chain.select.return_value = chain
+        chain.eq.return_value = chain
+        chain.neq.return_value = chain
+        chain.order.return_value = chain
+        chain.limit.return_value = chain
+        calls["n"] += 1
+        if calls["n"] == 1:
+            chain.execute.return_value = MagicMock(data=[])
+        else:
+            chain.execute.return_value = MagicMock(
+                data=[
+                    {
+                        "id": 9,
+                        "file_name": "busy.pdf",
+                        "processing_device": "other-gpu",
+                    }
+                ]
+            )
+        return chain
+
+    supabase.table.side_effect = selective_table
+
+    with (
+        patch("watcher.get_supabase", return_value=supabase),
+        patch("watcher.get_device_id", return_value="mini-pc-1"),
+        patch("watcher.reclaim_stale_scanning_jobs", return_value=0),
+    ):
+        chosen = select_next_intake_file()
+
+    assert chosen is None

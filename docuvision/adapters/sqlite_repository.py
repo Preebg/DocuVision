@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from docuvision.core.models import DocumentJob, JobStatus
+from docuvision.core.models import DocumentJob, PipelineStatus
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ class SqlitePipelineRepository:
         logger.info("sqlite.initialized path=%s", self._db_path)
 
     def create_job(self, file_name: str) -> DocumentJob:
-        job = DocumentJob(file_name=file_name, status=JobStatus.QUEUED)
+        job = DocumentJob(file_name=file_name, status=PipelineStatus.QUEUED)
         with self._connect() as connection:
             connection.execute(
                 """
@@ -120,7 +120,7 @@ class SqlitePipelineRepository:
     def update_status(
         self,
         job_id: str,
-        status: JobStatus,
+        status: PipelineStatus,
         *,
         local_path: str | None = None,
         layout_markdown: str | None = None,
@@ -140,7 +140,7 @@ class SqlitePipelineRepository:
             kwargs["extracted_payload"] = extracted_payload
         if error_message is not None:
             kwargs["error_message"] = error_message
-        elif status != JobStatus.FAILED:
+        elif status != PipelineStatus.FAILED:
             kwargs["error_message"] = None
 
         updated = job.transition_to(status, **kwargs)
@@ -149,7 +149,7 @@ class SqlitePipelineRepository:
     def mark_failed(self, job_id: str, error_message: str) -> DocumentJob:
         return self.update_status(
             job_id,
-            JobStatus.FAILED,
+            PipelineStatus.FAILED,
             error_message=error_message,
         )
 
@@ -163,7 +163,7 @@ class SqlitePipelineRepository:
             return None
         return self._row_to_job(row)
 
-    def list_by_status(self, status: JobStatus) -> list[DocumentJob]:
+    def list_by_status(self, status: PipelineStatus) -> list[DocumentJob]:
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM jobs WHERE status = ? ORDER BY created_at ASC",
@@ -187,7 +187,7 @@ class SqlitePipelineRepository:
         return DocumentJob(
             id=row["job_id"],
             file_name=row["file_name"],
-            status=JobStatus(row["status"]),
+            status=PipelineStatus(row["status"]),
             local_path=row["local_path"],
             layout_markdown=row["layout_markdown"],
             extracted_payload=self._loads(row["extracted_payload"]),

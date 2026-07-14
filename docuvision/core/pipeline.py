@@ -2,7 +2,7 @@
 
 Happy-path transitions (each recorded via ``PipelineRepository``):
 
-    QUEUED → DOWNLOADING → LAYOUT → VISION → STAGING → PENDING_VERIFICATION
+    QUEUED → SCANNING → LAYOUT → VISION → STAGING → PENDING_VERIFICATION
 """
 
 from __future__ import annotations
@@ -15,58 +15,17 @@ from docuvision.core.contracts import (
     StorageBackend,
     VisionLLMClient,
 )
-from docuvision.core.models import DocumentJob, JobStatus, PipelineResult
+from docuvision.core.errors import (
+    FatalProcessingError,
+    InfrastructureError,
+    PipelineError,
+    TransientError,
+    ValidationError,
+)
+from docuvision.core.models import DocumentJob, PipelineResult, PipelineStatus
+from docuvision.core.observability import bind_correlation, configure_json_logger
 
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Typed pipeline exceptions
-# ---------------------------------------------------------------------------
-
-
-class PipelineError(Exception):
-    """Base error for orchestration failures."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        job_id: str | None = None,
-        file_name: str | None = None,
-        status: JobStatus | None = None,
-        cause: BaseException | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.job_id = job_id
-        self.file_name = file_name
-        self.status = status
-        self.cause = cause
-
-
-class StorageError(PipelineError):
-    """Ingress / staging / archive failure from ``StorageBackend``."""
-
-
-class LayoutStageError(PipelineError):
-    """Docling (or equivalent) layout extraction failure."""
-
-
-class VisionStageError(PipelineError):
-    """Vision LLM extraction failure."""
-
-
-class StagingError(PipelineError):
-    """Failure while staging a document for HITL verification."""
-
-
-class RepositoryError(PipelineError):
-    """Job persistence / state-transition failure."""
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------------
+logger = configure_json_logger("docuvision.pipeline")
 
 
 class DocumentPipeline:
@@ -95,9 +54,10 @@ class DocumentPipeline:
     def process(self, file_name: str) -> PipelineResult:
         """Execute the full happy-path (or record ``FAILED``) for ``file_name``."""
         job = self._repository.create_job(file_name)
-        self._log.info(
-            "pipeline.start job_id=%s file_name=%s status=%s",
-            job.id,
+        correlation_id = job.id
+        job_log = bind_correlation(self._log, correlation_id)
+        job_log.info(
+            "pipeline.start file_name=%s status=%s",
             file_name,
             job.status.value,
         )
@@ -105,16 +65,15 @@ class DocumentPipeline:
         local_path: str | None = None
 
         try:
-            job, local_path = self._transition_downloading(job, file_name)
-            job = self._transition_layout(job, local_path)
-            job = self._transition_vision(job, local_path)
-            job = self._transition_staging(job, file_name, local_path)
-            job = self._transition_pending_verification(job)
+            job, local_path = self._transition_scanning(job, file_name, job_log)
+            job = self._transition_layout(job, local_path, job_log)
+            job = self._transition_vision(job, local_path, job_log)
+            job = self._transition_staging(job, file_name, local_path, job_log)
+            job = self._transition_pending_verification(job, job_log)
 
             self._storage.mark_processed(file_name, local_path)
-            self._log.info(
-                "pipeline.success job_id=%s file_name=%s status=%s",
-                job.id,
+            job_log.info(
+                "pipeline.success file_name=%s status=%s",
                 file_name,
                 job.status.value,
             )
@@ -124,10 +83,13 @@ class DocumentPipeline:
                 success=True,
                 status=job.status,
                 extracted_payload=job.extracted_payload,
+                correlation_id=correlation_id,
             )
 
         except Exception as exc:
-            return self._handle_failure(job, file_name, local_path, exc)
+            return self._handle_failure(
+                job, file_name, local_path, exc, job_log, correlation_id
+            )
 
     def process_next(self) -> PipelineResult | None:
         """Claim the next incoming file (if any) and run ``process``."""
@@ -138,78 +100,92 @@ class DocumentPipeline:
 
     # -- state transitions -------------------------------------------------
 
-    def _transition_downloading(
-        self, job: DocumentJob, file_name: str
+    def _transition_scanning(
+        self,
+        job: DocumentJob,
+        file_name: str,
+        job_log: logging.LoggerAdapter[logging.Logger],
     ) -> tuple[DocumentJob, str]:
-        job = self._persist(job, JobStatus.DOWNLOADING)
-        self._log.info("pipeline.state job_id=%s → %s", job.id, JobStatus.DOWNLOADING.value)
+        job = self._persist(job, PipelineStatus.SCANNING, job_log)
+        job_log.info("pipeline.state → %s", PipelineStatus.SCANNING.value)
         try:
             local_path = self._storage.fetch_to_workspace(file_name)
         except Exception as exc:
-            raise StorageError(
+            raise TransientError(
                 f"Failed to fetch '{file_name}' into workspace: {exc}",
-                job_id=job.id,
-                file_name=file_name,
-                status=JobStatus.DOWNLOADING,
-                cause=exc,
+                correlation_id=job.id,
             ) from exc
-        job = self._persist(job, JobStatus.DOWNLOADING, local_path=local_path)
+        job = self._persist(
+            job, PipelineStatus.SCANNING, job_log, local_path=local_path
+        )
         return job, local_path
 
-    def _transition_layout(self, job: DocumentJob, local_path: str) -> DocumentJob:
-        job = self._persist(job, JobStatus.LAYOUT)
-        self._log.info("pipeline.state job_id=%s → %s", job.id, JobStatus.LAYOUT.value)
+    def _transition_layout(
+        self,
+        job: DocumentJob,
+        local_path: str,
+        job_log: logging.LoggerAdapter[logging.Logger],
+    ) -> DocumentJob:
+        job = self._persist(job, PipelineStatus.LAYOUT, job_log)
+        job_log.info("pipeline.state → %s", PipelineStatus.LAYOUT.value)
         try:
             layout_markdown = self._layout.extract_layout(local_path)
         except Exception as exc:
-            raise LayoutStageError(
+            raise ValidationError(
                 f"Layout extraction failed for '{job.file_name}': {exc}",
-                job_id=job.id,
-                file_name=job.file_name,
-                status=JobStatus.LAYOUT,
-                cause=exc,
+                correlation_id=job.id,
             ) from exc
-        return self._persist(job, JobStatus.LAYOUT, layout_markdown=layout_markdown)
+        return self._persist(
+            job, PipelineStatus.LAYOUT, job_log, layout_markdown=layout_markdown
+        )
 
-    def _transition_vision(self, job: DocumentJob, local_path: str) -> DocumentJob:
-        job = self._persist(job, JobStatus.VISION)
-        self._log.info("pipeline.state job_id=%s → %s", job.id, JobStatus.VISION.value)
+    def _transition_vision(
+        self,
+        job: DocumentJob,
+        local_path: str,
+        job_log: logging.LoggerAdapter[logging.Logger],
+    ) -> DocumentJob:
+        job = self._persist(job, PipelineStatus.VISION, job_log)
+        job_log.info("pipeline.state → %s", PipelineStatus.VISION.value)
         layout_markdown = job.layout_markdown or ""
         try:
             payload = self._vision.extract_fields(local_path, layout_markdown)
         except Exception as exc:
-            raise VisionStageError(
+            raise FatalProcessingError(
                 f"Vision extraction failed for '{job.file_name}': {exc}",
-                job_id=job.id,
-                file_name=job.file_name,
-                status=JobStatus.VISION,
-                cause=exc,
+                correlation_id=job.id,
             ) from exc
-        return self._persist(job, JobStatus.VISION, extracted_payload=payload)
+        return self._persist(
+            job, PipelineStatus.VISION, job_log, extracted_payload=payload
+        )
 
     def _transition_staging(
-        self, job: DocumentJob, file_name: str, local_path: str
+        self,
+        job: DocumentJob,
+        file_name: str,
+        local_path: str,
+        job_log: logging.LoggerAdapter[logging.Logger],
     ) -> DocumentJob:
-        job = self._persist(job, JobStatus.STAGING)
-        self._log.info("pipeline.state job_id=%s → %s", job.id, JobStatus.STAGING.value)
+        job = self._persist(job, PipelineStatus.STAGING, job_log)
+        job_log.info("pipeline.state → %s", PipelineStatus.STAGING.value)
         try:
             self._storage.stage_for_verification(file_name, local_path)
         except Exception as exc:
-            raise StagingError(
+            raise InfrastructureError(
                 f"Staging failed for '{file_name}': {exc}",
-                job_id=job.id,
-                file_name=file_name,
-                status=JobStatus.STAGING,
-                cause=exc,
+                correlation_id=job.id,
             ) from exc
         return job
 
-    def _transition_pending_verification(self, job: DocumentJob) -> DocumentJob:
-        job = self._persist(job, JobStatus.PENDING_VERIFICATION)
-        self._log.info(
-            "pipeline.state job_id=%s → %s",
-            job.id,
-            JobStatus.PENDING_VERIFICATION.value,
+    def _transition_pending_verification(
+        self,
+        job: DocumentJob,
+        job_log: logging.LoggerAdapter[logging.Logger],
+    ) -> DocumentJob:
+        job = self._persist(job, PipelineStatus.PENDING_VERIFICATION, job_log)
+        job_log.info(
+            "pipeline.state → %s",
+            PipelineStatus.PENDING_VERIFICATION.value,
         )
         return job
 
@@ -218,7 +194,8 @@ class DocumentPipeline:
     def _persist(
         self,
         job: DocumentJob,
-        status: JobStatus,
+        status: PipelineStatus,
+        job_log: logging.LoggerAdapter[logging.Logger],
         *,
         local_path: str | None = None,
         layout_markdown: str | None = None,
@@ -235,12 +212,14 @@ class DocumentPipeline:
                 error_message=error_message,
             )
         except Exception as exc:
-            raise RepositoryError(
+            job_log.error(
+                "pipeline.persist_failed status=%s error=%s",
+                status.value,
+                exc,
+            )
+            raise InfrastructureError(
                 f"Failed to persist status {status.value} for job {job.id}: {exc}",
-                job_id=job.id,
-                file_name=job.file_name,
-                status=status,
-                cause=exc,
+                correlation_id=job.id,
             ) from exc
 
     def _handle_failure(
@@ -249,31 +228,34 @@ class DocumentPipeline:
         file_name: str,
         local_path: str | None,
         exc: BaseException,
+        job_log: logging.LoggerAdapter[logging.Logger],
+        correlation_id: str,
     ) -> PipelineResult:
         error_message = str(exc)
-        self._log.error(
-            "pipeline.failure job_id=%s file_name=%s error=%s",
-            job.id,
+        error_class = type(exc).__name__
+        job_log.error(
+            "pipeline.failure file_name=%s error_class=%s error=%s",
             file_name,
+            error_class,
             error_message,
         )
 
         try:
             failed = self._repository.mark_failed(job.id, error_message)
         except Exception as state_exc:
-            self._log.error(
-                "pipeline.state_error job_id=%s could not record FAILED: %s",
-                job.id,
+            job_log.error(
+                "pipeline.state_error could not record FAILED: %s",
                 state_exc,
             )
-            failed = job.transition_to(JobStatus.FAILED, error_message=error_message)
+            failed = job.transition_to(
+                PipelineStatus.FAILED, error_message=error_message
+            )
 
         try:
             self._storage.mark_failed(file_name, local_path)
         except Exception as storage_exc:
-            self._log.warning(
-                "pipeline.storage_deadletter_error file_name=%s error=%s",
-                file_name,
+            job_log.warning(
+                "pipeline.storage_deadletter_error error=%s",
                 storage_exc,
             )
 
@@ -281,6 +263,17 @@ class DocumentPipeline:
             job_id=failed.id,
             file_name=file_name,
             success=False,
-            status=JobStatus.FAILED,
+            status=PipelineStatus.FAILED,
             error_message=error_message,
+            correlation_id=correlation_id,
         )
+
+
+__all__ = [
+    "DocumentPipeline",
+    "FatalProcessingError",
+    "InfrastructureError",
+    "PipelineError",
+    "TransientError",
+    "ValidationError",
+]

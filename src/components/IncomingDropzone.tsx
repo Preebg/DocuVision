@@ -2,7 +2,7 @@
 
 import { useCallback, useRef, useState } from "react";
 import { getSupabaseClient } from "@/lib/supabase/client";
-import { INCOMING_STORAGE_BUCKET } from "@/lib/types";
+import { INCOMING_STORAGE_BUCKET, PipelineStatus } from "@/lib/types";
 
 const ACCEPTED_EXTENSIONS = [
   ".pdf",
@@ -70,7 +70,7 @@ export function IncomingDropzone({ onUploaded }: IncomingDropzoneProps) {
             .from("document_pipeline")
             .insert({
               file_name: objectName,
-              status: "IMPORTED",
+              status: PipelineStatus.QUEUED,
               storage_bucket: INCOMING_STORAGE_BUCKET,
             });
 

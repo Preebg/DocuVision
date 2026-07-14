@@ -1,11 +1,14 @@
-export type PipelineStatus =
-  | "IMPORTED"
-  | "SCANNING"
-  | "PENDING_VERIFICATION"
-  | "VERIFIED"
-  | "FAILED"
-  | "COMPLETED"
-  | "processed";
+import pipelineStatusContract from "../../contracts/pipeline-status.json";
+
+type ContractStages = typeof pipelineStatusContract.STAGES;
+
+/** Runtime constant mirrored from `contracts/pipeline-status.json`. */
+export const PipelineStatus = pipelineStatusContract.STAGES as {
+  readonly [K in keyof ContractStages]: K;
+};
+
+/** Compiler type aligned 1:1 with the shared pipeline status contract. */
+export type PipelineStatusType = keyof typeof PipelineStatus;
 
 export interface ExtractedFields {
   "Applicant Name"?: string;
@@ -26,12 +29,14 @@ export interface DocumentPipelineRow {
   created_at: string;
   file_name: string | null;
   extracted_payload: ExtractedPayload | null;
-  status: PipelineStatus | null;
+  status: PipelineStatusType | null;
   error_message: string | null;
   verified_payload: ExtractedPayload | null;
   verified_by: string | null;
   reject_reason: string | null;
   storage_bucket: string | null;
+  processing_device?: string | null;
+  processing_started_at?: string | null;
 }
 
 export const VERIFICATION_FIELD_KEYS = [
@@ -46,25 +51,38 @@ export const VERIFIED_BY = "Web_Operator_V1";
 export const DEFAULT_STORAGE_BUCKET = "verification_queue";
 export const INCOMING_STORAGE_BUCKET = "incoming_forms";
 
-export const QUEUE_STATUSES: PipelineStatus[] = [
-  "IMPORTED",
-  "SCANNING",
-  "PENDING_VERIFICATION",
+/** Statuses shown in the HITL review pane (prefer ready reviews over in-flight scans). */
+export const HITL_REVIEW_STATUSES: PipelineStatusType[] = [
+  PipelineStatus.PENDING_VERIFICATION,
+];
+
+/** Intake statuses still being scanned on the watcher / worker device. */
+export const IN_PROGRESS_STATUSES: PipelineStatusType[] = [
+  PipelineStatus.QUEUED,
+  PipelineStatus.SCANNING,
+  PipelineStatus.LAYOUT,
+  PipelineStatus.VISION,
+  PipelineStatus.STAGING,
+];
+
+export const QUEUE_STATUSES: PipelineStatusType[] = [
+  ...IN_PROGRESS_STATUSES,
+  ...HITL_REVIEW_STATUSES,
 ];
 
 export const PIPELINE_PHASES = [
   {
-    status: "IMPORTED" as const,
-    label: "Imported",
+    status: PipelineStatus.QUEUED,
+    label: "Queued",
     description: "File landed in intake storage",
   },
   {
-    status: "SCANNING" as const,
+    status: PipelineStatus.SCANNING,
     label: "Scanning",
     description: "Layout + vision extraction running",
   },
   {
-    status: "PENDING_VERIFICATION" as const,
+    status: PipelineStatus.PENDING_VERIFICATION,
     label: "Data Retrieved",
     description: "Ready for human verification",
   },
@@ -122,7 +140,9 @@ export function isPdfFileName(fileName: string | null | undefined): boolean {
   return Boolean(fileName?.toLowerCase().endsWith(".pdf"));
 }
 
-export function phaseIndexForStatus(status: PipelineStatus | null | undefined): number {
+export function phaseIndexForStatus(
+  status: PipelineStatusType | null | undefined,
+): number {
   if (!status) {
     return -1;
   }

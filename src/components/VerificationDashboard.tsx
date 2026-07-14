@@ -11,9 +11,11 @@ import {
   DEFAULT_STORAGE_BUCKET,
   DocumentPipelineRow,
   getFieldValue,
+  HITL_REVIEW_STATUSES,
   INCOMING_STORAGE_BUCKET,
+  IN_PROGRESS_STATUSES,
   normalizeExtractedPayload,
-  QUEUE_STATUSES,
+  PipelineStatus,
   VERIFICATION_FIELD_KEYS,
   VERIFIED_BY,
   VerificationFieldKey,
@@ -23,6 +25,8 @@ const REJECT_REASON = "UNREADABLE_DOCUMENT";
 
 export function VerificationDashboard() {
   const [queueItem, setQueueItem] = useState<DocumentPipelineRow | null>(null);
+  const [inProgressItem, setInProgressItem] =
+    useState<DocumentPipelineRow | null>(null);
   const [queueLoading, setQueueLoading] = useState(true);
   const [documentUrl, setDocumentUrl] = useState<string | null>(null);
   const [documentLoading, setDocumentLoading] = useState(false);
@@ -51,7 +55,7 @@ export function VerificationDashboard() {
       const supabase = getSupabaseClient();
       const bucket =
         item.storage_bucket ??
-        (item.status === "PENDING_VERIFICATION"
+        (item.status === PipelineStatus.PENDING_VERIFICATION
           ? DEFAULT_STORAGE_BUCKET
           : INCOMING_STORAGE_BUCKET);
 
@@ -60,7 +64,10 @@ export function VerificationDashboard() {
         .createSignedUrl(item.file_name, 3600);
 
       if (error || !data?.signedUrl) {
-        if (item.status === "IMPORTED" || item.status === "SCANNING") {
+        if (
+          item.status === PipelineStatus.QUEUED ||
+          item.status === PipelineStatus.SCANNING
+        ) {
           setDocumentUrl(null);
           setDocumentError(null);
           return;
@@ -99,23 +106,46 @@ export function VerificationDashboard() {
 
     try {
       const supabase = getSupabaseClient();
-      const { data, error } = await supabase
+
+      // Ready for human review first — extraction already done; watcher may be
+      // scanning the next incoming_forms object on the device in parallel.
+      const { data: readyData, error: readyError } = await supabase
         .from("document_pipeline")
         .select("*")
-        .in("status", QUEUE_STATUSES)
+        .in("status", HITL_REVIEW_STATUSES)
         .order("created_at", { ascending: true })
         .limit(1)
         .maybeSingle();
 
-      if (error) {
-        throw error;
+      if (readyError) {
+        throw readyError;
       }
 
-      const item = data as DocumentPipelineRow | null;
+      const { data: scanningData, error: scanningError } = await supabase
+        .from("document_pipeline")
+        .select("*")
+        .in("status", IN_PROGRESS_STATUSES)
+        .order("created_at", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (scanningError) {
+        throw scanningError;
+      }
+
+      const readyItem = readyData as DocumentPipelineRow | null;
+      const scanningItem = scanningData as DocumentPipelineRow | null;
+      const item = readyItem ?? scanningItem;
+
       setQueueItem(item);
+      setInProgressItem(
+        readyItem && scanningItem && scanningItem.id !== readyItem.id
+          ? scanningItem
+          : null,
+      );
 
       if (item) {
-        if (item.status === "PENDING_VERIFICATION") {
+        if (item.status === PipelineStatus.PENDING_VERIFICATION) {
           populateFields(item);
         } else {
           setFields({
@@ -131,6 +161,7 @@ export function VerificationDashboard() {
       }
     } catch (err) {
       setQueueItem(null);
+      setInProgressItem(null);
       setActionError(
         err instanceof Error ? err.message : "Failed to load verification queue.",
       );
@@ -188,13 +219,13 @@ export function VerificationDashboard() {
       const { error } = await supabase
         .from("document_pipeline")
         .update({
-          status: "VERIFIED",
+          status: PipelineStatus.VERIFIED,
           verified_payload: verifiedPayload,
           verified_by: VERIFIED_BY,
           reject_reason: null,
         })
         .eq("id", queueItem.id)
-        .eq("status", "PENDING_VERIFICATION");
+        .eq("status", PipelineStatus.PENDING_VERIFICATION);
 
       if (error) {
         throw error;
@@ -223,12 +254,12 @@ export function VerificationDashboard() {
       const { error } = await supabase
         .from("document_pipeline")
         .update({
-          status: "FAILED",
+          status: PipelineStatus.FAILED,
           reject_reason: REJECT_REASON,
           verified_by: VERIFIED_BY,
         })
         .eq("id", queueItem.id)
-        .eq("status", "PENDING_VERIFICATION");
+        .eq("status", PipelineStatus.PENDING_VERIFICATION);
 
       if (error) {
         throw error;
@@ -244,9 +275,11 @@ export function VerificationDashboard() {
     }
   };
 
-  const isReviewReady = queueItem?.status === "PENDING_VERIFICATION";
+  const isReviewReady =
+    queueItem?.status === PipelineStatus.PENDING_VERIFICATION;
   const isProcessing =
-    queueItem?.status === "IMPORTED" || queueItem?.status === "SCANNING";
+    queueItem?.status === PipelineStatus.QUEUED ||
+    queueItem?.status === PipelineStatus.SCANNING;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -255,6 +288,20 @@ export function VerificationDashboard() {
         status={queueItem?.status ?? null}
         fileName={queueItem?.file_name}
       />
+
+      {inProgressItem && isReviewReady && (
+        <div className="border-b border-accent/25 bg-accent/5 px-6 py-2.5 text-xs text-muted">
+          Device is scanning{" "}
+          <span className="font-mono text-foreground">
+            {inProgressItem.file_name}
+          </span>
+          {inProgressItem.processing_device
+            ? ` on ${inProgressItem.processing_device}`
+            : ""}
+          {" · "}
+          you can approve or reject the document below meanwhile.
+        </div>
+      )}
 
       {queueLoading && !queueItem ? (
         <div className="flex flex-1 items-center justify-center">
@@ -291,8 +338,8 @@ export function VerificationDashboard() {
               <h2 className="mt-1 text-lg font-semibold text-foreground">
                 {isReviewReady
                   ? "Review Extracted Fields"
-                  : queueItem.status === "IMPORTED"
-                    ? "Imported — waiting for scanner"
+                  : queueItem.status === PipelineStatus.QUEUED
+                    ? "Queued — waiting for scanner"
                     : "Scanning document…"}
               </h2>
               <p className="mt-1 text-xs text-muted">
@@ -304,9 +351,14 @@ export function VerificationDashboard() {
             <div className="flex-1 overflow-y-auto px-6 py-5">
               {isProcessing && (
                 <div className="rounded-lg border border-accent/30 bg-accent/5 px-4 py-3 text-sm text-muted">
-                  The watcher picked this file up from{" "}
-                  <span className="font-mono text-foreground">incoming_forms</span>
-                  . Phase updates stream here automatically while Ollama runs.
+                  The watcher is processing this file one-at-a-time on{" "}
+                  <span className="font-mono text-foreground">
+                    {queueItem.processing_device ?? "the local device"}
+                  </span>
+                  . When extraction finishes it moves here for approve/reject,
+                  and the next{" "}
+                  <span className="font-mono text-foreground">incoming_forms</span>{" "}
+                  file starts scanning.
                 </div>
               )}
 

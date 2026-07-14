@@ -3,17 +3,18 @@
 import {
   PIPELINE_PHASES,
   PipelineStatus,
+  type PipelineStatusType,
   phaseIndexForStatus,
 } from "@/lib/types";
 
-const PHASE_ORDER: PipelineStatus[] = [
-  "IMPORTED",
-  "SCANNING",
-  "PENDING_VERIFICATION",
+const PHASE_ORDER: PipelineStatusType[] = [
+  PipelineStatus.QUEUED,
+  PipelineStatus.SCANNING,
+  PipelineStatus.PENDING_VERIFICATION,
 ];
 
 type PipelinePhaseStepperProps = {
-  status: PipelineStatus | null;
+  status: PipelineStatusType | null;
   fileName?: string | null;
 };
 
@@ -22,8 +23,8 @@ export function PipelinePhaseStepper({
   fileName,
 }: PipelinePhaseStepperProps) {
   const activeIndex = phaseIndexForStatus(status);
-  const failed = status === "FAILED";
-  const completedReview = status === "VERIFIED";
+  const failed = status === PipelineStatus.FAILED;
+  const completedReview = status === PipelineStatus.VERIFIED;
 
   return (
     <div className="border-b border-border bg-surface-elevated px-6 py-4">
