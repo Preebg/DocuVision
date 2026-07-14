@@ -53,6 +53,8 @@ class DocumentJob(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     file_name: str
     status: PipelineStatus = PipelineStatus.QUEUED  # type: ignore[valid-type]
+    retry_count: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
     local_path: str | None = None
     layout_markdown: str | None = None
     extracted_payload: dict[str, Any] | None = None
@@ -68,6 +70,8 @@ class DocumentJob(BaseModel):
         layout_markdown: str | None = None,
         extracted_payload: dict[str, Any] | None = None,
         error_message: str | None = None,
+        retry_count: int | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> DocumentJob:
         """Return a copy advanced to ``status`` with optional field updates."""
         updates: dict[str, Any] = {
@@ -80,6 +84,10 @@ class DocumentJob(BaseModel):
             updates["layout_markdown"] = layout_markdown
         if extracted_payload is not None:
             updates["extracted_payload"] = extracted_payload
+        if retry_count is not None:
+            updates["retry_count"] = retry_count
+        if metadata is not None:
+            updates["metadata"] = metadata
         if error_message is not None:
             updates["error_message"] = error_message
         elif status != PipelineStatus.FAILED:

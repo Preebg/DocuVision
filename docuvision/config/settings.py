@@ -74,9 +74,17 @@ class Settings(BaseSettings):
     ollama_warmup: bool = Field(default=True)
     ollama_pdf_max_pages: int = Field(default=5, ge=1)
 
-    # -- layout / watcher -------------------------------------------------
+    # -- layout / watcher / fault protection -----------------------------
     layout_max_chars: int = Field(default=8000, ge=500)
     watcher_poll_interval_seconds: int = Field(default=3, ge=1)
+    MAX_RETRIES: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            "Transient-error retry ceiling before dead-lettering a document. "
+            "Env: DOCUVISION_MAX_RETRIES."
+        ),
+    )
 
     @field_validator("ollama_base_url")
     @classmethod

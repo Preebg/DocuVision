@@ -43,6 +43,7 @@ def build_pipeline(
         repository=repository,
         layout=layout,
         vision=vision,
+        max_retries=settings.MAX_RETRIES,
     )
 
 

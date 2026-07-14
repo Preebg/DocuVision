@@ -67,6 +67,8 @@ class PipelineRepository(Protocol):
         layout_markdown: str | None = None,
         extracted_payload: dict[str, Any] | None = None,
         error_message: str | None = None,
+        retry_count: int | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> DocumentJob:
         """Transition and persist a job's state."""
         ...
