@@ -229,12 +229,48 @@ class SqlitePipelineRepository:
         return self._row_to_job(row)
 
     def list_by_status(self, status: PipelineStatus) -> list[DocumentJob]:
+        return self.list_by_statuses([status])
+
+    def list_by_statuses(self, statuses: list[PipelineStatus] | tuple[PipelineStatus, ...]) -> list[DocumentJob]:
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        values = [status.value for status in statuses]
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM documents WHERE status = ? ORDER BY created_at ASC",
-                (status.value,),
+                f"""
+                SELECT * FROM documents
+                WHERE status IN ({placeholders})
+                ORDER BY created_at ASC
+                """,
+                values,
             ).fetchall()
         return [self._row_to_job(row) for row in rows]
+
+    def emit_audit_event(
+        self,
+        *,
+        job_id: str,
+        actor: str,
+        action: str,
+        from_status: str | None,
+        to_status: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Append-only insert into ``pipeline_events`` with an explicit actor."""
+        identity = (actor or "").strip()
+        if not identity:
+            raise ValueError("emit_audit_event requires a non-empty actor identity.")
+        with self._connect() as connection:
+            self._insert_event(
+                connection,
+                job_id=job_id,
+                action=action,
+                from_status=from_status,
+                to_status=to_status,
+                details=details,
+                actor=identity,
+            )
 
     def _insert_event(
         self,
@@ -245,6 +281,7 @@ class SqlitePipelineRepository:
         from_status: str | None,
         to_status: str | None,
         details: dict[str, Any] | None,
+        actor: str | None = None,
     ) -> None:
         connection.execute(
             """
@@ -255,7 +292,7 @@ class SqlitePipelineRepository:
             (
                 str(uuid4()),
                 job_id,
-                self._actor,
+                actor if actor is not None else self._actor,
                 action,
                 from_status,
                 to_status,

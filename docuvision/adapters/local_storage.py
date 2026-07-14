@@ -1,10 +1,16 @@
-"""Local filesystem ``StorageBackend`` for air-gapped ingress / egress."""
+"""Local filesystem ``StorageBackend`` for air-gapped ingress / egress.
+
+Directory roots may be local disks or network-attached share mounts
+(SMB / NFS). Configure via ``DOCUVISION_DATA_ROOT`` or explicit
+``DOCUVISION_INCOMING_DIR``, ``DOCUVISION_VERIFICATION_DIR``, etc.
+"""
 
 from __future__ import annotations
 
 import logging
 import shutil
 from pathlib import Path
+from typing import BinaryIO
 
 from docuvision.config.settings import Settings
 
@@ -89,6 +95,63 @@ class LocalStorageAdapter:
             ingress = self._safe_join(self._incoming, file_name)
             source = ingress if ingress.is_file() else source
         self._archive(file_name, str(source) if source.is_file() else None, self._failed, label="failed")
+
+    def write_incoming(self, file_name: str, source: BinaryIO | bytes) -> str:
+        """Write an uploaded document into the ingress directory.
+
+        Returns the stored basename (may be uniquified on collision).
+        """
+        destination = self._unique_path(self._incoming, file_name)
+        if isinstance(source, bytes):
+            destination.write_bytes(source)
+        else:
+            with destination.open("wb") as handle:
+                shutil.copyfileobj(source, handle)
+        logger.info("storage.write_incoming file_name=%s path=%s", destination.name, destination)
+        return destination.name
+
+    def resolve_document_path(
+        self,
+        file_name: str,
+        *,
+        prefer_verification: bool = True,
+    ) -> Path:
+        """Locate a document under verification and/or incoming (basename-safe).
+
+        Raises ``FileNotFoundError`` when no matching file exists.
+        """
+        roots = (
+            (self._verification, self._incoming)
+            if prefer_verification
+            else (self._incoming, self._verification)
+        )
+        for root in roots:
+            candidate = self._safe_join(root, file_name)
+            if candidate.is_file():
+                return candidate
+        raise FileNotFoundError(f"Document not found in storage roots: {file_name}")
+
+    def cleanup_workspace(self, local_path: str | None) -> None:
+        """Remove a scratch workspace file if it still exists."""
+        if not local_path:
+            return
+        path = Path(local_path)
+        if not path.is_file():
+            return
+        try:
+            # Only delete paths that live under the configured workspace root.
+            resolved = path.resolve()
+            workspace_root = self._workspace.resolve()
+            if not resolved.is_relative_to(workspace_root):
+                logger.warning(
+                    "storage.cleanup refused path outside workspace: %s",
+                    local_path,
+                )
+                return
+            resolved.unlink(missing_ok=True)
+            logger.info("storage.cleanup_workspace path=%s", resolved)
+        except OSError:
+            logger.exception("storage.cleanup_workspace failed path=%s", local_path)
 
     def _archive(
         self,

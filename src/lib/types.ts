@@ -25,7 +25,7 @@ export interface ExtractedPayload {
 }
 
 export interface DocumentPipelineRow {
-  id: number;
+  id: string;
   created_at: string;
   file_name: string | null;
   extracted_payload: ExtractedPayload | null;
@@ -48,15 +48,55 @@ export const VERIFICATION_FIELD_KEYS = [
 export type VerificationFieldKey = (typeof VERIFICATION_FIELD_KEYS)[number];
 
 export const VERIFIED_BY = "Web_Operator_V1";
+export const OPERATOR_IDENTITY_STORAGE_KEY = "docuvision_operator_identity";
 export const DEFAULT_STORAGE_BUCKET = "verification_queue";
 export const INCOMING_STORAGE_BUCKET = "incoming_forms";
 
-/** Statuses shown in the HITL review pane (prefer ready reviews over in-flight scans). */
+/**
+ * Resolve the clerk / operator identity for non-repudiation on PATCH.
+ * Priority: localStorage → NEXT_PUBLIC_OPERATOR_IDENTITY → VERIFIED_BY fallback.
+ */
+export function getOperatorIdentity(): string {
+  if (typeof window !== "undefined") {
+    const stored = window.localStorage
+      .getItem(OPERATOR_IDENTITY_STORAGE_KEY)
+      ?.trim();
+    if (stored) {
+      return stored;
+    }
+  }
+  const fromEnv = process.env.NEXT_PUBLIC_OPERATOR_IDENTITY?.trim();
+  if (fromEnv) {
+    return fromEnv;
+  }
+  return VERIFIED_BY;
+}
+
+export function setOperatorIdentity(identity: string): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  const cleaned = identity.trim();
+  if (cleaned) {
+    window.localStorage.setItem(OPERATOR_IDENTITY_STORAGE_KEY, cleaned);
+  }
+}
+/** Statuses shown in the HITL review pane. */
 export const HITL_REVIEW_STATUSES: PipelineStatusType[] = [
   PipelineStatus.PENDING_VERIFICATION,
 ];
 
-/** Intake statuses still being scanned on the watcher / worker device. */
+/**
+ * Machine stages rendered in the Active Ingestion Queue
+ * (AI layout / vision work in flight).
+ */
+export const ACTIVE_INGESTION_STATUSES: PipelineStatusType[] = [
+  PipelineStatus.SCANNING,
+  PipelineStatus.LAYOUT,
+  PipelineStatus.VISION,
+];
+
+/** Broader intake statuses including queueing / staging. */
 export const IN_PROGRESS_STATUSES: PipelineStatusType[] = [
   PipelineStatus.QUEUED,
   PipelineStatus.SCANNING,
@@ -69,6 +109,14 @@ export const QUEUE_STATUSES: PipelineStatusType[] = [
   ...IN_PROGRESS_STATUSES,
   ...HITL_REVIEW_STATUSES,
 ];
+
+export const INGESTION_STEP_LABELS: Partial<
+  Record<PipelineStatusType, string>
+> = {
+  SCANNING: "Scanning",
+  LAYOUT: "Layout",
+  VISION: "Vision",
+};
 
 export const PIPELINE_PHASES = [
   {

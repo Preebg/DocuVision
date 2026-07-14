@@ -5,6 +5,10 @@ Usage (from laptop, targeting Mini PC Ollama)::
     set DOCUVISION_DATA_ROOT=C:\\data\\docuvision
     set DOCUVISION_OLLAMA_BASE_URL=http://192.168.1.50:11434
     python run_worker.py
+
+Optional Postgres::
+
+    set DOCUVISION_DATABASE_URL=postgresql://docuvision:docuvision@localhost:5432/docuvision
 """
 
 from __future__ import annotations
@@ -13,9 +17,8 @@ import logging
 import sys
 import time
 
-from docuvision.adapters.local_storage import LocalStorageAdapter
 from docuvision.adapters.ollama_client import OllamaVisionClient
-from docuvision.adapters.sqlite_repository import SqlitePipelineRepository
+from docuvision.composition import build_backends
 from docuvision.config.settings import Settings, get_settings
 from docuvision.core.pipeline import DocumentPipeline
 from docuvision.stages.layout import DoclingLayoutStage
@@ -30,10 +33,7 @@ def build_pipeline(
     ollama: OllamaVisionClient | None = None,
 ) -> DocumentPipeline:
     """Wire concrete adapters into the Protocol-only orchestrator."""
-    settings.ensure_directories()
-
-    storage = LocalStorageAdapter(settings)
-    repository = SqlitePipelineRepository(settings.resolved_sqlite_path())
+    storage, repository = build_backends(settings)
     layout = DoclingLayoutStage()
     vision_client = ollama or OllamaVisionClient(settings)
     vision = VisionExtractionStage(vision_client)
@@ -98,7 +98,10 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("processed=%s", settings.resolved_processed_dir())
     logger.info("failed=%s", settings.resolved_failed_dir())
     logger.info("verification=%s", settings.resolved_verification_dir())
-    logger.info("sqlite=%s", settings.resolved_sqlite_path())
+    if settings.database_url:
+        logger.info("repository=postgres")
+    else:
+        logger.info("repository=sqlite path=%s", settings.resolved_sqlite_path())
     logger.info("ollama_base_url=%s", settings.ollama_base_url)
 
     settings.ensure_directories()

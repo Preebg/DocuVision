@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     Environment variables use the ``DOCUVISION_`` prefix, e.g.:
 
         DOCUVISION_DATA_ROOT=/data
-        DOCUVISION_OLLAMA_BASE_URL=http://192.168.1.150:11434
+        DOCUVISION_OLLAMA_BASE_URL=http://192.168.87.219:11434
     """
 
     model_config = SettingsConfigDict(
@@ -51,10 +51,25 @@ class Settings(BaseSettings):
         description="Scratch copies during processing. Defaults to ``{data_root}/workspace``.",
     )
 
-    # -- embedded SQLite --------------------------------------------------
+    # -- persistence ------------------------------------------------------
+    database_url: str | None = Field(
+        default=None,
+        description=(
+            "Postgres DSN for the pipeline repository. "
+            "Env: DOCUVISION_DATABASE_URL. Empty or unset → embedded SQLite."
+        ),
+    )
     sqlite_path: Path | None = Field(
         default=None,
-        description="Job DB path. Defaults to ``{data_root}/docuvision.db``.",
+        description="Job DB path when Postgres is not configured. "
+        "Defaults to ``{data_root}/docuvision.db``.",
+    )
+    api_cors_origins: str = Field(
+        default="http://localhost:3000,http://127.0.0.1:3000,tauri://localhost",
+        description=(
+            "Comma-separated CORS origins for the FastAPI SPA host. "
+            "Env: DOCUVISION_API_CORS_ORIGINS."
+        ),
     )
 
     # -- Mini PC Ollama (network-pluggable) -------------------------------
@@ -90,6 +105,18 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_ollama_url(cls, value: str) -> str:
         return value.rstrip("/")
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def _empty_database_url_to_none(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    def cors_origins_list(self) -> list[str]:
+        return [part.strip() for part in self.api_cors_origins.split(",") if part.strip()]
 
     # -- resolved path helpers (composition root may call ensure_directories)
     def resolved_incoming_dir(self) -> Path:

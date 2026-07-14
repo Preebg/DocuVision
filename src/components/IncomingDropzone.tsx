@@ -1,8 +1,7 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
-import { getSupabaseClient } from "@/lib/supabase/client";
-import { INCOMING_STORAGE_BUCKET, PipelineStatus } from "@/lib/types";
+import { ingestDocument } from "@/lib/api";
 
 const ACCEPTED_EXTENSIONS = [
   ".pdf",
@@ -27,10 +26,6 @@ function isAcceptedFile(file: File): boolean {
   );
 }
 
-function sanitizeFileName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
 export function IncomingDropzone({ onUploaded }: IncomingDropzoneProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -51,43 +46,19 @@ export function IncomingDropzone({ onUploaded }: IncomingDropzoneProps) {
       setMessage(null);
 
       try {
-        const supabase = getSupabaseClient();
-
         for (const file of files) {
-          const objectName = `${Date.now()}_${sanitizeFileName(file.name)}`;
-          const { error: uploadError } = await supabase.storage
-            .from(INCOMING_STORAGE_BUCKET)
-            .upload(objectName, file, {
-              contentType: file.type || "application/octet-stream",
-              upsert: false,
-            });
-
-          if (uploadError) {
-            throw new Error(uploadError.message);
-          }
-
-          const { error: insertError } = await supabase
-            .from("document_pipeline")
-            .insert({
-              file_name: objectName,
-              status: PipelineStatus.QUEUED,
-              storage_bucket: INCOMING_STORAGE_BUCKET,
-            });
-
-          if (insertError) {
-            throw new Error(insertError.message);
-          }
+          await ingestDocument(file);
         }
 
         setMessage(
           files.length === 1
-            ? `Imported ${files[0].name} — watcher will start scanning shortly.`
-            : `Imported ${files.length} files — watcher will process them in order.`,
+            ? `Imported ${files[0].name} — worker will start scanning shortly.`
+            : `Imported ${files.length} files — worker will process them in order.`,
         );
         onUploaded?.();
       } catch (err) {
         setError(
-          err instanceof Error ? err.message : "Upload to incoming_forms failed.",
+          err instanceof Error ? err.message : "Upload to local intake failed.",
         );
       } finally {
         setUploading(false);
@@ -134,10 +105,10 @@ export function IncomingDropzone({ onUploaded }: IncomingDropzoneProps) {
         } ${uploading ? "pointer-events-none opacity-70" : ""}`}
       >
         <p className="text-sm font-medium text-foreground">
-          {uploading ? "Uploading to incoming_forms…" : "Drop a document to ingest"}
+          {uploading ? "Writing to local intake…" : "Drop a document to ingest"}
         </p>
         <p className="mt-1 text-xs text-muted">
-          PDF or image · lands in the Supabase intake bucket · auto-processed
+          PDF or image · lands in the local incoming folder · processed by the worker
         </p>
         <input
           ref={inputRef}

@@ -1,11 +1,13 @@
-# DocuVision local stack
+# DocuVision local air-gapped stack
 #
 # Worker (pipeline):  docker compose up --build worker
+# API + static UI:    docker compose up --build api web
 # Full stack:         docker compose up --build
 # With local Ollama:  docker compose --profile ollama up --build
 #
 # Drop PDFs/images into ./data/incoming — the worker polls that folder.
 # Point DOCUVISION_OLLAMA_BASE_URL at your Mini PC or host Ollama.
+# SPA talks to FastAPI via NEXT_PUBLIC_API_BASE_URL (browser-reachable host).
 
 services:
   worker:
@@ -16,6 +18,7 @@ services:
       - ./data:/data
     environment:
       DOCUVISION_DATA_ROOT: /data
+      DOCUVISION_DATABASE_URL: ${DOCUVISION_DATABASE_URL:-}
       DOCUVISION_OLLAMA_BASE_URL: ${DOCUVISION_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       DOCUVISION_OLLAMA_PRIMARY_MODEL: ${DOCUVISION_OLLAMA_PRIMARY_MODEL:-qwen3-vl:8b-thinking}
       DOCUVISION_OLLAMA_FALLBACK_MODEL: ${DOCUVISION_OLLAMA_FALLBACK_MODEL:-qwen2.5vl:3b}
@@ -25,18 +28,31 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "run_api.py"]
+    volumes:
+      - ./data:/data
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      DOCUVISION_DATA_ROOT: /data
+      DOCUVISION_DATABASE_URL: ${DOCUVISION_DATABASE_URL:-}
+      DOCUVISION_API_CORS_ORIGINS: ${DOCUVISION_API_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,tauri://localhost}
+    restart: unless-stopped
+
   web:
     build:
       context: .
       dockerfile: Dockerfile.web
       args:
-        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
-        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
     ports:
       - "${WEB_PORT:-3000}:3000"
-    environment:
-      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
-      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+    depends_on:
+      - api
     restart: unless-stopped
 
   ollama:

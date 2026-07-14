@@ -1,4 +1,4 @@
-import { SupabaseStatusIndicator } from "@/components/SupabaseStatusIndicator";
+import { ApiStatusIndicator } from "@/components/ApiStatusIndicator";
 
 function LogoMark() {
   return (
@@ -58,7 +58,7 @@ export function Sidebar() {
       </nav>
 
       <div className="border-t border-border p-4">
-        <SupabaseStatusIndicator />
+        <ApiStatusIndicator />
       </div>
     </aside>
   );

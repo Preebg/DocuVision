@@ -81,6 +81,19 @@ class PipelineRepository(Protocol):
         """Load a job by id, or ``None`` if missing."""
         ...
 
+    def emit_audit_event(
+        self,
+        *,
+        job_id: str,
+        actor: str,
+        action: str,
+        from_status: str | None,
+        to_status: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Append an immutable row to ``pipeline_events`` (non-repudiation)."""
+        ...
+
 
 @runtime_checkable
 class LayoutExtractor(Protocol):

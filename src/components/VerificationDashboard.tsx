@@ -1,36 +1,49 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { DocumentViewer } from "@/components/DocumentViewer";
 import { IncomingDropzone } from "@/components/IncomingDropzone";
 import { PipelinePhaseStepper } from "@/components/PipelinePhaseStepper";
 import { QueueClearState } from "@/components/QueueClearState";
-import { getSupabaseClient } from "@/lib/supabase/client";
+import {
+  documentFileUrl,
+  fetchQueue,
+  patchDocument,
+} from "@/lib/api";
 import {
   buildVerifiedPayload,
-  DEFAULT_STORAGE_BUCKET,
   DocumentPipelineRow,
   getFieldValue,
-  HITL_REVIEW_STATUSES,
-  INCOMING_STORAGE_BUCKET,
-  IN_PROGRESS_STATUSES,
+  getOperatorIdentity,
+  INGESTION_STEP_LABELS,
   normalizeExtractedPayload,
   PipelineStatus,
+  PipelineStatusType,
   VERIFICATION_FIELD_KEYS,
-  VERIFIED_BY,
   VerificationFieldKey,
 } from "@/lib/types";
 
 const REJECT_REASON = "UNREADABLE_DOCUMENT";
+const POLL_MS = 2500;
+
+function stepLabel(status: PipelineStatusType | null | undefined): string {
+  if (status && status in INGESTION_STEP_LABELS) {
+    return INGESTION_STEP_LABELS[status] ?? status;
+  }
+  return status ?? "Processing";
+}
 
 export function VerificationDashboard() {
-  const [queueItem, setQueueItem] = useState<DocumentPipelineRow | null>(null);
-  const [inProgressItem, setInProgressItem] =
-    useState<DocumentPipelineRow | null>(null);
+  const [activeIngestion, setActiveIngestion] = useState<DocumentPipelineRow[]>(
+    [],
+  );
+  const [pendingVerification, setPendingVerification] = useState<
+    DocumentPipelineRow[]
+  >([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [queueLoading, setQueueLoading] = useState(true);
   const [documentUrl, setDocumentUrl] = useState<string | null>(null);
   const [documentLoading, setDocumentLoading] = useState(false);
-  const [documentError, setDocumentError] = useState<string | null>(null);
   const [fields, setFields] = useState<Record<VerificationFieldKey, string>>({
     "Applicant Name": "",
     "ID Number": "",
@@ -40,54 +53,13 @@ export function VerificationDashboard() {
     null,
   );
   const [actionError, setActionError] = useState<string | null>(null);
+  const pendingRef = useRef(pendingVerification);
+  pendingRef.current = pendingVerification;
 
-  const loadDocumentUrl = useCallback(async (item: DocumentPipelineRow) => {
-    if (!item.file_name) {
-      setDocumentUrl(null);
-      setDocumentError("This queue item has no associated file name.");
-      return;
-    }
-
-    setDocumentLoading(true);
-    setDocumentError(null);
-
-    try {
-      const supabase = getSupabaseClient();
-      const bucket =
-        item.storage_bucket ??
-        (item.status === PipelineStatus.PENDING_VERIFICATION
-          ? DEFAULT_STORAGE_BUCKET
-          : INCOMING_STORAGE_BUCKET);
-
-      const { data, error } = await supabase.storage
-        .from(bucket)
-        .createSignedUrl(item.file_name, 3600);
-
-      if (error || !data?.signedUrl) {
-        if (
-          item.status === PipelineStatus.QUEUED ||
-          item.status === PipelineStatus.SCANNING
-        ) {
-          setDocumentUrl(null);
-          setDocumentError(null);
-          return;
-        }
-        throw new Error(
-          error?.message ??
-            "Could not generate a signed URL for the verification document.",
-        );
-      }
-
-      setDocumentUrl(data.signedUrl);
-    } catch (err) {
-      setDocumentUrl(null);
-      setDocumentError(
-        err instanceof Error ? err.message : "Failed to load document preview.",
-      );
-    } finally {
-      setDocumentLoading(false);
-    }
-  }, []);
+  const selectedItem =
+    pendingVerification.find((row) => row.id === selectedId) ??
+    pendingVerification[0] ??
+    null;
 
   const populateFields = useCallback((item: DocumentPipelineRow) => {
     const nextFields = VERIFICATION_FIELD_KEYS.reduce(
@@ -100,109 +72,82 @@ export function VerificationDashboard() {
     setFields(nextFields);
   }, []);
 
-  const fetchNextPending = useCallback(async () => {
-    setQueueLoading(true);
-    setActionError(null);
-
-    try {
-      const supabase = getSupabaseClient();
-
-      // Ready for human review first — extraction already done; watcher may be
-      // scanning the next incoming_forms object on the device in parallel.
-      const { data: readyData, error: readyError } = await supabase
-        .from("document_pipeline")
-        .select("*")
-        .in("status", HITL_REVIEW_STATUSES)
-        .order("created_at", { ascending: true })
-        .limit(1)
-        .maybeSingle();
-
-      if (readyError) {
-        throw readyError;
-      }
-
-      const { data: scanningData, error: scanningError } = await supabase
-        .from("document_pipeline")
-        .select("*")
-        .in("status", IN_PROGRESS_STATUSES)
-        .order("created_at", { ascending: true })
-        .limit(1)
-        .maybeSingle();
-
-      if (scanningError) {
-        throw scanningError;
-      }
-
-      const readyItem = readyData as DocumentPipelineRow | null;
-      const scanningItem = scanningData as DocumentPipelineRow | null;
-      const item = readyItem ?? scanningItem;
-
-      setQueueItem(item);
-      setInProgressItem(
-        readyItem && scanningItem && scanningItem.id !== readyItem.id
-          ? scanningItem
-          : null,
-      );
-
-      if (item) {
-        if (item.status === PipelineStatus.PENDING_VERIFICATION) {
-          populateFields(item);
-        } else {
-          setFields({
-            "Applicant Name": "",
-            "ID Number": "",
-            "Document Date": "",
-          });
+  const refreshQueues = useCallback(
+    async (signal?: AbortSignal) => {
+      try {
+        const payload = await fetchQueue(signal);
+        if (signal?.aborted) {
+          return;
         }
-        await loadDocumentUrl(item);
-      } else {
-        setDocumentUrl(null);
-        setDocumentError(null);
+        setActiveIngestion(payload.active_ingestion);
+        setPendingVerification(payload.pending_verification);
+        setActionError(null);
+
+        setSelectedId((current) => {
+          if (
+            current &&
+            payload.pending_verification.some((row) => row.id === current)
+          ) {
+            return current;
+          }
+          return payload.pending_verification[0]?.id ?? null;
+        });
+      } catch (err) {
+        if (signal?.aborted) {
+          return;
+        }
+        setActionError(
+          err instanceof Error ? err.message : "Failed to load local queue.",
+        );
+      } finally {
+        if (!signal?.aborted) {
+          setQueueLoading(false);
+        }
       }
-    } catch (err) {
-      setQueueItem(null);
-      setInProgressItem(null);
-      setActionError(
-        err instanceof Error ? err.message : "Failed to load verification queue.",
-      );
-    } finally {
-      setQueueLoading(false);
-    }
-  }, [loadDocumentUrl, populateFields]);
+    },
+    [],
+  );
 
   useEffect(() => {
-    void fetchNextPending();
-  }, [fetchNextPending]);
-
-  useEffect(() => {
-    const supabase = getSupabaseClient();
-    const channel = supabase
-      .channel("document_pipeline_live")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "document_pipeline" },
-        () => {
-          void fetchNextPending();
-        },
-      )
-      .subscribe();
-
+    const controller = new AbortController();
+    void refreshQueues(controller.signal);
     const poll = window.setInterval(() => {
-      void fetchNextPending();
-    }, 2500);
-
+      void refreshQueues();
+    }, POLL_MS);
     return () => {
+      controller.abort();
       window.clearInterval(poll);
-      void supabase.removeChannel(channel);
     };
-  }, [fetchNextPending]);
+  }, [refreshQueues]);
+
+  useEffect(() => {
+    if (!selectedId) {
+      setDocumentUrl(null);
+      setDocumentLoading(false);
+      setFields({
+        "Applicant Name": "",
+        "ID Number": "",
+        "Document Date": "",
+      });
+      return;
+    }
+
+    const item = pendingRef.current.find((row) => row.id === selectedId);
+    if (!item) {
+      return;
+    }
+
+    populateFields(item);
+    setDocumentLoading(false);
+    setDocumentUrl(documentFileUrl(item.id));
+  }, [selectedId, populateFields]);
 
   const handleFieldChange = (key: VerificationFieldKey, value: string) => {
     setFields((current) => ({ ...current, [key]: value }));
   };
 
   const handleApprove = async () => {
-    if (!queueItem) {
+    if (!selectedItem) {
       return;
     }
 
@@ -210,28 +155,18 @@ export function VerificationDashboard() {
     setActionError(null);
 
     try {
-      const supabase = getSupabaseClient();
+      const operator = getOperatorIdentity();
       const verifiedPayload = buildVerifiedPayload(
         fields,
-        queueItem.extracted_payload,
+        selectedItem.extracted_payload,
       );
-
-      const { error } = await supabase
-        .from("document_pipeline")
-        .update({
-          status: PipelineStatus.VERIFIED,
-          verified_payload: verifiedPayload,
-          verified_by: VERIFIED_BY,
-          reject_reason: null,
-        })
-        .eq("id", queueItem.id)
-        .eq("status", PipelineStatus.PENDING_VERIFICATION);
-
-      if (error) {
-        throw error;
-      }
-
-      await fetchNextPending();
+      await patchDocument(selectedItem.id, {
+        action: "approve",
+        verified_payload: verifiedPayload,
+        verified_by: operator,
+        actor: operator,
+      });
+      await refreshQueues();
     } catch (err) {
       setActionError(
         err instanceof Error ? err.message : "Failed to approve document.",
@@ -242,7 +177,7 @@ export function VerificationDashboard() {
   };
 
   const handleReject = async () => {
-    if (!queueItem) {
+    if (!selectedItem) {
       return;
     }
 
@@ -250,22 +185,20 @@ export function VerificationDashboard() {
     setActionError(null);
 
     try {
-      const supabase = getSupabaseClient();
-      const { error } = await supabase
-        .from("document_pipeline")
-        .update({
-          status: PipelineStatus.FAILED,
-          reject_reason: REJECT_REASON,
-          verified_by: VERIFIED_BY,
-        })
-        .eq("id", queueItem.id)
-        .eq("status", PipelineStatus.PENDING_VERIFICATION);
-
-      if (error) {
-        throw error;
-      }
-
-      await fetchNextPending();
+      const operator = getOperatorIdentity();
+      // Include any in-progress field corrections for the audit trail.
+      const verifiedPayload = buildVerifiedPayload(
+        fields,
+        selectedItem.extracted_payload,
+      );
+      await patchDocument(selectedItem.id, {
+        action: "reject",
+        reject_reason: REJECT_REASON,
+        verified_payload: verifiedPayload,
+        verified_by: operator,
+        actor: operator,
+      });
+      await refreshQueues();
     } catch (err) {
       setActionError(
         err instanceof Error ? err.message : "Failed to reject document.",
@@ -276,41 +209,93 @@ export function VerificationDashboard() {
   };
 
   const isReviewReady =
-    queueItem?.status === PipelineStatus.PENDING_VERIFICATION;
-  const isProcessing =
-    queueItem?.status === PipelineStatus.QUEUED ||
-    queueItem?.status === PipelineStatus.SCANNING;
+    selectedItem?.status === PipelineStatus.PENDING_VERIFICATION;
+  const stepperStatus =
+    selectedItem?.status ?? activeIngestion[0]?.status ?? null;
+  const stepperFileName =
+    selectedItem?.file_name ?? activeIngestion[0]?.file_name ?? null;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <IncomingDropzone onUploaded={() => void fetchNextPending()} />
-      <PipelinePhaseStepper
-        status={queueItem?.status ?? null}
-        fileName={queueItem?.file_name}
-      />
+      <IncomingDropzone onUploaded={() => void refreshQueues()} />
+      <PipelinePhaseStepper status={stepperStatus} fileName={stepperFileName} />
 
-      {inProgressItem && isReviewReady && (
-        <div className="border-b border-accent/25 bg-accent/5 px-6 py-2.5 text-xs text-muted">
-          Device is scanning{" "}
-          <span className="font-mono text-foreground">
-            {inProgressItem.file_name}
-          </span>
-          {inProgressItem.processing_device
-            ? ` on ${inProgressItem.processing_device}`
-            : ""}
-          {" · "}
-          you can approve or reject the document below meanwhile.
-        </div>
-      )}
+      <div className="grid shrink-0 grid-cols-1 gap-0 border-b border-border lg:grid-cols-2">
+        <QueuePanel
+          title="Active Ingestion Queue"
+          subtitle="Machine pipeline in flight"
+          emptyLabel="No documents scanning, extracting layout, or running vision."
+          loading={queueLoading && activeIngestion.length === 0}
+        >
+          {activeIngestion.map((item) => (
+            <div
+              key={item.id}
+              className="flex items-center gap-3 border-b border-border/60 px-4 py-3 last:border-b-0"
+            >
+              <span
+                className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-accent"
+                aria-hidden
+              />
+              <div className="min-w-0 flex-1">
+                <p className="truncate font-mono text-xs text-foreground">
+                  {item.file_name ?? item.id}
+                </p>
+                <p className="mt-0.5 text-[11px] text-muted">
+                  {new Date(item.created_at).toLocaleString()}
+                </p>
+              </div>
+              <span className="shrink-0 rounded-md border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-accent">
+                {stepLabel(item.status)}
+              </span>
+            </div>
+          ))}
+        </QueuePanel>
 
-      {queueLoading && !queueItem ? (
+        <QueuePanel
+          title="Pending Verification Queue"
+          subtitle="Awaiting clerk review"
+          emptyLabel="No documents waiting for verification."
+          loading={queueLoading && pendingVerification.length === 0}
+          className="border-t border-border lg:border-l lg:border-t-0"
+        >
+          {pendingVerification.map((item) => {
+            const active = item.id === selectedItem?.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setSelectedId(item.id)}
+                className={`flex w-full items-center gap-3 border-b border-border/60 px-4 py-3 text-left last:border-b-0 transition ${
+                  active
+                    ? "bg-accent/10"
+                    : "hover:bg-surface-elevated"
+                }`}
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="truncate font-mono text-xs text-foreground">
+                    {item.file_name ?? item.id}
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-muted">
+                    {new Date(item.created_at).toLocaleString()}
+                  </p>
+                </div>
+                <span className="shrink-0 rounded-md border border-border bg-background px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted">
+                  Review
+                </span>
+              </button>
+            );
+          })}
+        </QueuePanel>
+      </div>
+
+      {queueLoading && !selectedItem && activeIngestion.length === 0 ? (
         <div className="flex flex-1 items-center justify-center">
           <div className="flex flex-col items-center gap-3 text-muted">
             <div className="h-8 w-8 animate-spin rounded-full border-2 border-border border-t-accent" />
-            <p className="text-sm">Syncing verification queue…</p>
+            <p className="text-sm">Syncing local queues…</p>
           </div>
         </div>
-      ) : !queueItem ? (
+      ) : !selectedItem ? (
         <div className="min-h-0 flex-1">
           <QueueClearState />
         </div>
@@ -318,50 +303,28 @@ export function VerificationDashboard() {
         <div className="flex min-h-0 flex-1">
           <section className="flex w-[60%] min-w-0 flex-col border-r border-border bg-surface">
             <DocumentViewer
-              fileName={queueItem.file_name}
+              fileName={selectedItem.file_name}
               documentUrl={documentUrl}
               loading={documentLoading}
-              error={
-                documentError ??
-                (isProcessing
-                  ? "Preview may appear after the file is staged for verification."
-                  : null)
-              }
+              error={null}
             />
           </section>
 
           <section className="flex w-[40%] min-w-0 flex-col bg-surface-elevated">
             <header className="border-b border-border px-6 py-4">
               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-accent">
-                {isReviewReady ? "Data Validation" : "In Progress"}
+                Data Validation
               </p>
               <h2 className="mt-1 text-lg font-semibold text-foreground">
-                {isReviewReady
-                  ? "Review Extracted Fields"
-                  : queueItem.status === PipelineStatus.QUEUED
-                    ? "Queued — waiting for scanner"
-                    : "Scanning document…"}
+                Review Extracted Fields
               </h2>
               <p className="mt-1 text-xs text-muted">
-                Queue #{queueItem.id} ·{" "}
-                {new Date(queueItem.created_at).toLocaleString()}
+                Job {selectedItem.id.slice(0, 8)} ·{" "}
+                {new Date(selectedItem.created_at).toLocaleString()}
               </p>
             </header>
 
             <div className="flex-1 overflow-y-auto px-6 py-5">
-              {isProcessing && (
-                <div className="rounded-lg border border-accent/30 bg-accent/5 px-4 py-3 text-sm text-muted">
-                  The watcher is processing this file one-at-a-time on{" "}
-                  <span className="font-mono text-foreground">
-                    {queueItem.processing_device ?? "the local device"}
-                  </span>
-                  . When extraction finishes it moves here for approve/reject,
-                  and the next{" "}
-                  <span className="font-mono text-foreground">incoming_forms</span>{" "}
-                  file starts scanning.
-                </div>
-              )}
-
               {isReviewReady && (
                 <>
                   <div className="space-y-4">
@@ -383,7 +346,7 @@ export function VerificationDashboard() {
                     ))}
                   </div>
 
-                  {normalizeExtractedPayload(queueItem.extracted_payload)
+                  {normalizeExtractedPayload(selectedItem.extracted_payload)
                     .full_text && (
                     <div className="mt-6">
                       <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">
@@ -391,8 +354,9 @@ export function VerificationDashboard() {
                       </p>
                       <pre className="max-h-40 overflow-y-auto rounded-lg border border-border bg-background p-3 text-xs leading-relaxed text-muted">
                         {
-                          normalizeExtractedPayload(queueItem.extracted_payload)
-                            .full_text
+                          normalizeExtractedPayload(
+                            selectedItem.extracted_payload,
+                          ).full_text
                         }
                       </pre>
                     </div>
@@ -431,5 +395,47 @@ export function VerificationDashboard() {
         </div>
       )}
     </div>
+  );
+}
+
+function QueuePanel({
+  title,
+  subtitle,
+  emptyLabel,
+  loading,
+  children,
+  className = "",
+}: {
+  title: string;
+  subtitle: string;
+  emptyLabel: string;
+  loading: boolean;
+  children: ReactNode;
+  className?: string;
+}) {
+  const hasChildren = Array.isArray(children)
+    ? children.length > 0
+    : Boolean(children);
+
+  return (
+    <section className={`flex min-h-[9.5rem] flex-col bg-surface ${className}`}>
+      <header className="flex items-baseline justify-between gap-3 border-b border-border px-4 py-2.5">
+        <div>
+          <h3 className="text-xs font-semibold uppercase tracking-[0.14em] text-foreground">
+            {title}
+          </h3>
+          <p className="text-[11px] text-muted">{subtitle}</p>
+        </div>
+      </header>
+      <div className="max-h-40 min-h-0 flex-1 overflow-y-auto">
+        {loading ? (
+          <p className="px-4 py-6 text-xs text-muted">Loading…</p>
+        ) : !hasChildren ? (
+          <p className="px-4 py-6 text-xs text-muted">{emptyLabel}</p>
+        ) : (
+          children
+        )}
+      </div>
+    </section>
   );
 }

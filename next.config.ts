@@ -1,16 +1,12 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  output: "standalone",
+  // Static SPA for Tauri / air-gapped packaging — no Node server routes.
+  output: "export",
   images: {
-    remotePatterns: [
-      {
-        protocol: "https",
-        hostname: "*.supabase.co",
-        pathname: "/storage/v1/object/**",
-      },
-    ],
+    unoptimized: true,
   },
+  trailingSlash: true,
 };
 
 export default nextConfig;

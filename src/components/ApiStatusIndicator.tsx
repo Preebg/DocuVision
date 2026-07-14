@@ -1,35 +1,28 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getSupabaseClient, isSupabaseConfigured } from "@/lib/supabase/client";
+import { fetchHealth } from "@/lib/api";
 
-type ConnectionState = "checking" | "connected" | "disconnected" | "unconfigured";
+type ConnectionState = "checking" | "connected" | "disconnected";
 
-export function SupabaseStatusIndicator() {
+export function ApiStatusIndicator() {
   const [state, setState] = useState<ConnectionState>("checking");
+  const [repository, setRepository] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!isSupabaseConfigured()) {
-      setState("unconfigured");
-      return;
-    }
-
     let cancelled = false;
 
     async function checkConnection() {
       try {
-        const supabase = getSupabaseClient();
-        const { error } = await supabase
-          .from("document_pipeline")
-          .select("id")
-          .limit(1);
-
+        const health = await fetchHealth();
         if (!cancelled) {
-          setState(error ? "disconnected" : "connected");
+          setState(health.status === "ok" ? "connected" : "disconnected");
+          setRepository(health.repository);
         }
       } catch {
         if (!cancelled) {
           setState("disconnected");
+          setRepository(null);
         }
       }
     }
@@ -50,19 +43,14 @@ export function SupabaseStatusIndicator() {
       text: "text-amber-300",
     },
     connected: {
-      label: "Supabase Online",
+      label: repository ? `API Online · ${repository}` : "API Online",
       dot: "bg-success",
       text: "text-success",
     },
     disconnected: {
-      label: "Supabase Offline",
+      label: "API Offline",
       dot: "bg-danger",
       text: "text-danger",
-    },
-    unconfigured: {
-      label: "Not Configured",
-      dot: "bg-muted",
-      text: "text-muted",
     },
   }[state];
 
