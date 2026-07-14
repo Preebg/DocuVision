@@ -81,8 +81,9 @@ class ClassificationStage:
 
     def _llm_classify(self, prompt: str) -> str:
         assert self._client is not None
-        # Prefer the lighter fallback model for the router — vision VRAM stays free.
-        model = self._classify_model or self._client.fallback_model
+        # Prefer the configured primary (usually the lighter VL model) for the
+        # text-only router so the heavy fallback stays reserved for vision.
+        model = self._classify_model or self._client.primary_model
         messages = [
             {
                 "role": "system",
