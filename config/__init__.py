@@ -79,8 +79,8 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-PRIMARY_MODEL = os.getenv("OLLAMA_PRIMARY_MODEL", "qwen3-vl:8b")
-FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5vl:3b")
+PRIMARY_MODEL = os.getenv("OLLAMA_PRIMARY_MODEL", "qwen2.5vl:3b")
+FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen3-vl:8b")
 # Aligned with contracts/pipeline-status.json (QUEUED replaces legacy IMPORTED).
 PIPELINE_STATUS_QUEUED = "QUEUED"
 PIPELINE_STATUS_IMPORTED = PIPELINE_STATUS_QUEUED  # backwards-compatible alias

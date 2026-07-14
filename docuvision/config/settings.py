@@ -88,8 +88,8 @@ class Settings(BaseSettings):
         ),
     )
     ollama_timeout_seconds: int = Field(default=300, ge=1)
-    ollama_primary_model: str = Field(default="qwen3-vl:8b-thinking")
-    ollama_fallback_model: str = Field(default="qwen2.5vl:3b")
+    ollama_primary_model: str = Field(default="qwen2.5vl:3b")
+    ollama_fallback_model: str = Field(default="qwen3-vl:8b-thinking")
     ollama_num_ctx: int = Field(default=8192, ge=512)
     ollama_image_max_dimension: int = Field(default=1280, ge=256)
     ollama_json_mode: bool = Field(default=True)
@@ -121,6 +121,32 @@ class Settings(BaseSettings):
         description=(
             "When keyword routing is inconclusive, run a lightweight text-only "
             "LLM classify call (classify_router.md). Disable on ultra-low RAM."
+        ),
+    )
+
+    # -- Pillar 1: advanced local ingestion --------------------------------
+    ingestion_sources_path: Path | None = Field(
+        default=None,
+        description=(
+            "YAML registry of autonomous drop sources. "
+            "Env: DOCUVISION_INGESTION_SOURCES_PATH. "
+            "Defaults to ``<repo>/config/ingestion_sources.yaml``."
+        ),
+    )
+    ingestion_archive_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Internal archive for successfully ingested source files (moved, not copied). "
+            "Env: DOCUVISION_INGESTION_ARCHIVE_DIR. "
+            "Defaults to ``{data_root}/ingestion_archive``."
+        ),
+    )
+    ingestion_status_stale_seconds: int = Field(
+        default=45,
+        ge=5,
+        description=(
+            "API treats the ingestion heartbeat as offline when older than this. "
+            "Env: DOCUVISION_INGESTION_STATUS_STALE_SECONDS."
         ),
     )
 
@@ -169,6 +195,17 @@ class Settings(BaseSettings):
         # docuvision/config/settings.py → repo root / config / schemas
         return Path(__file__).resolve().parents[2] / "config" / "schemas"
 
+    def resolved_ingestion_sources_path(self) -> Path:
+        if self.ingestion_sources_path is not None:
+            return self.ingestion_sources_path
+        return Path(__file__).resolve().parents[2] / "config" / "ingestion_sources.yaml"
+
+    def resolved_ingestion_archive_dir(self) -> Path:
+        return self.ingestion_archive_dir or (self.data_root / "ingestion_archive")
+
+    def resolved_ingestion_status_path(self) -> Path:
+        return self.data_root / "ingestion" / "status.json"
+
     def ensure_directories(self) -> None:
         """Create the on-prem directory tree if missing."""
         for path in (
@@ -178,6 +215,8 @@ class Settings(BaseSettings):
             self.resolved_verification_dir(),
             self.resolved_workspace_dir(),
             self.resolved_release_dir(),
+            self.resolved_ingestion_archive_dir(),
+            self.resolved_ingestion_status_path().parent,
         ):
             path.mkdir(parents=True, exist_ok=True)
         self.resolved_sqlite_path().parent.mkdir(parents=True, exist_ok=True)
