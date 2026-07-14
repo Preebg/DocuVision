@@ -250,6 +250,56 @@ class PostgresPipelineRepository:
             return None
         return self._row_to_job(row)
 
+    def claim_next_queued(self) -> DocumentJob | None:
+        """Claim oldest ``QUEUED`` row via ``FOR UPDATE SKIP LOCKED`` → ``SCANNING``."""
+        with self._pool.connection() as connection:
+            # Non-blocking row lock: concurrent workers skip already-claimed ids.
+            row = connection.execute(
+                """
+                WITH next_job AS (
+                    SELECT id
+                    FROM documents
+                    WHERE status = %s
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE documents AS d
+                SET status = %s
+                FROM next_job
+                WHERE d.id = next_job.id
+                RETURNING d.*
+                """,
+                (PipelineStatus.QUEUED.value, PipelineStatus.SCANNING.value),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+
+            claimed = self._row_to_job(row)
+            # Persist updated_at inside metadata JSON (operational clock).
+            stamped = claimed.transition_to(PipelineStatus.SCANNING)
+            metadata = self._pack_metadata(stamped)
+            connection.execute(
+                "UPDATE documents SET metadata = %s WHERE id = %s",
+                (self._dumps(metadata), stamped.id),
+            )
+            self._insert_event(
+                connection,
+                job_id=stamped.id,
+                action="JOB_CLAIMED",
+                from_status=PipelineStatus.QUEUED.value,
+                to_status=PipelineStatus.SCANNING.value,
+                details={"filename": stamped.file_name},
+            )
+            connection.commit()
+            logger.info(
+                "postgres.claim_next_queued id=%s file_name=%s",
+                stamped.id,
+                stamped.file_name,
+            )
+            return stamped
+
     def list_by_status(self, status: PipelineStatus) -> list[DocumentJob]:
         return self.list_by_statuses([status])
 

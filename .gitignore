@@ -35,3 +35,7 @@ Thumbs.db
 
 # Local Docker / on-prem data volume
 /data/
+
+# Tauri
+/src-tauri/target/
+/src-tauri/gen/

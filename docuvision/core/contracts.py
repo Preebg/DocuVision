@@ -81,6 +81,17 @@ class PipelineRepository(Protocol):
         """Load a job by id, or ``None`` if missing."""
         ...
 
+    def claim_next_queued(self) -> DocumentJob | None:
+        """Atomically claim the oldest ``QUEUED`` job for extraction.
+
+        Implementations must guarantee that concurrent workers never receive
+        the same document: PostgreSQL uses ``SELECT … FOR UPDATE SKIP LOCKED``;
+        SQLite uses an immediate-transaction compare-and-set update.
+        Returns the claimed job already transitioned to ``SCANNING``, or
+        ``None`` when the queue is empty.
+        """
+        ...
+
     def emit_audit_event(
         self,
         *,

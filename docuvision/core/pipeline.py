@@ -124,11 +124,18 @@ class DocumentPipeline:
             )
 
     def process_next(self) -> PipelineResult | None:
-        """Claim the next incoming file (if any) and run ``process``."""
-        incoming = self._storage.list_incoming()
-        if not incoming:
+        """Enroll ingress files, claim one ``QUEUED`` job, then run ``process``.
+
+        Concurrent workers are safe: ``claim_next_queued`` uses
+        ``FOR UPDATE SKIP LOCKED`` (Postgres) or an immediate CAS (SQLite).
+        """
+        for file_name in self._storage.list_incoming():
+            self._repository.create_job(file_name)
+
+        claimed = self._repository.claim_next_queued()
+        if claimed is None:
             return None
-        return self.process(incoming[0])
+        return self.process(claimed.file_name)
 
     # -- state transitions -------------------------------------------------
 

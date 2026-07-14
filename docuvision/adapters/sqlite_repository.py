@@ -228,6 +228,71 @@ class SqlitePipelineRepository:
             return None
         return self._row_to_job(row)
 
+    def claim_next_queued(self) -> DocumentJob | None:
+        """Atomically claim oldest ``QUEUED`` → ``SCANNING`` (SQLite CAS).
+
+        SQLite lacks ``FOR UPDATE SKIP LOCKED``. ``BEGIN IMMEDIATE`` serializes
+        writers so concurrent processes cannot pull the same row; the
+        ``WHERE status = QUEUED`` compare-and-set rejects lost races.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM documents
+                WHERE status = ?
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (PipelineStatus.QUEUED.value,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return None
+
+            candidate = self._row_to_job(row)
+            claimed = candidate.transition_to(PipelineStatus.SCANNING)
+            metadata = self._pack_metadata(claimed)
+            cursor = connection.execute(
+                """
+                UPDATE documents SET
+                    status = ?,
+                    metadata = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    PipelineStatus.SCANNING.value,
+                    self._dumps(metadata),
+                    claimed.id,
+                    PipelineStatus.QUEUED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return None
+
+            self._insert_event(
+                connection,
+                job_id=claimed.id,
+                action="JOB_CLAIMED",
+                from_status=PipelineStatus.QUEUED.value,
+                to_status=PipelineStatus.SCANNING.value,
+                details={"filename": claimed.file_name},
+            )
+            connection.commit()
+            logger.info(
+                "sqlite.claim_next_queued id=%s file_name=%s",
+                claimed.id,
+                claimed.file_name,
+            )
+            return claimed
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def list_by_status(self, status: PipelineStatus) -> list[DocumentJob]:
         return self.list_by_statuses([status])
 

@@ -1,12 +1,20 @@
-"""Network-pluggable Ollama client targeting a LAN Mini PC endpoint."""
+"""Network-pluggable Ollama client targeting a LAN Mini PC endpoint.
+
+VRAM protection: a process-wide ``asyncio.Semaphore(1)`` gates every chat /
+vision request so concurrent CPU workers never schedule more than one
+in-flight model run against the host GPU.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
+import threading
+from concurrent.futures import Future
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import requests
 
@@ -23,10 +31,76 @@ OLLAMA_INFERENCE_OPTIONS = {
     "top_p": 0.1,
 }
 
+T = TypeVar("T")
+
 try:
     from PIL import Image
 except ImportError:  # pragma: no cover
     Image = None  # type: ignore[misc, assignment]
+
+
+class _VramExclusiveGate:
+    """Serialize VRAM-bound Ollama calls with ``asyncio.Semaphore(1)``.
+
+    A dedicated background event loop owns the semaphore so sync worker
+    threads (and async callers) share one exclusive token across the process.
+    """
+
+    def __init__(self) -> None:
+        self._ready = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._semaphore: asyncio.Semaphore | None = None
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="ollama-vram-gate",
+            daemon=True,
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=10):
+            raise RuntimeError("Failed to start Ollama VRAM gate event loop")
+
+    def _run_loop(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        self._semaphore = asyncio.Semaphore(1)
+        self._ready.set()
+        loop.run_forever()
+
+    async def _gated(self, fn: Callable[[], T]) -> T:
+        assert self._semaphore is not None
+        async with self._semaphore:
+            return await asyncio.to_thread(fn)
+
+    def run(self, fn: Callable[[], T]) -> T:
+        assert self._loop is not None
+        future: Future[T] = asyncio.run_coroutine_threadsafe(
+            self._gated(fn), self._loop
+        )
+        return future.result()
+
+    async def run_async(self, fn: Callable[[], T]) -> T:
+        """Async entry — still serializes through the shared semaphore."""
+        assert self._loop is not None
+        if asyncio.get_running_loop() is self._loop:
+            return await self._gated(fn)
+        future: Future[T] = asyncio.run_coroutine_threadsafe(
+            self._gated(fn), self._loop
+        )
+        return await asyncio.wrap_future(future)
+
+
+# Process-wide: at most one vision inference hits local VRAM at a time.
+_VRAM_GATE: _VramExclusiveGate | None = None
+_VRAM_GATE_LOCK = threading.Lock()
+
+
+def _get_vram_gate() -> _VramExclusiveGate:
+    global _VRAM_GATE
+    with _VRAM_GATE_LOCK:
+        if _VRAM_GATE is None:
+            _VRAM_GATE = _VramExclusiveGate()
+        return _VRAM_GATE
 
 
 class ModelRecoverableError(RuntimeError):
@@ -37,6 +111,7 @@ class OllamaVisionClient:
     """``VisionLLMClient`` backed by HTTP calls to ``DOCUVISION_OLLAMA_BASE_URL``.
 
     The worker laptop posts to the Mini PC; no local GPU is required here.
+    All ``/api/chat`` traffic is funneled through ``asyncio.Semaphore(1)``.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -78,6 +153,28 @@ class OllamaVisionClient:
         return parse_json_response(ai_text)
 
     def chat(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
+        """Sync chat — exclusive via process-wide ``asyncio.Semaphore(1)``."""
+        return _get_vram_gate().run(
+            lambda: self._chat_http(model, messages, response_format)
+        )
+
+    async def achat(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
+        """Async chat — same VRAM exclusivity as ``chat``."""
+        return await _get_vram_gate().run_async(
+            lambda: self._chat_http(model, messages, response_format)
+        )
+
+    def _chat_http(
         self,
         model: str,
         messages: list[dict[str, Any]],
