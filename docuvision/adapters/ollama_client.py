@@ -23,6 +23,7 @@ from docuvision.extraction_schema import (
     EXTRACTION_JSON_SCHEMA,
     parse_json_response,
 )
+from docuvision.registry.schema_registry import DocumentSchema, SchemaRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -144,11 +145,29 @@ class OllamaVisionClient:
         layout_markdown: str,
         *,
         model: str | None = None,
+        schema: DocumentSchema | None = None,
+        registry: SchemaRegistry | None = None,
     ) -> dict[str, Any]:
-        """POST images + layout markdown to Mini PC ``/api/chat``; return parsed JSON."""
+        """POST images + layout markdown to Mini PC ``/api/chat``; return parsed JSON.
+
+        When ``schema`` is provided, prompts and the Ollama ``format`` schema are
+        built dynamically from the matched semantic field contract.
+        """
         chosen_model = model or self._primary_model
-        messages = self.build_vision_messages(local_path, layout_markdown)
-        response_format = EXTRACTION_JSON_SCHEMA if self._json_mode else None
+        messages = self.build_vision_messages(
+            local_path,
+            layout_markdown,
+            schema=schema,
+            registry=registry,
+        )
+        if self._json_mode:
+            if schema is not None:
+                reg = registry or SchemaRegistry()
+                response_format = reg.build_extraction_json_schema(schema)
+            else:
+                response_format = EXTRACTION_JSON_SCHEMA
+        else:
+            response_format = None
         ai_text = self.chat(chosen_model, messages, response_format=response_format)
         return parse_json_response(ai_text)
 
@@ -276,20 +295,34 @@ class OllamaVisionClient:
         logger.info("ollama.warmup ok snippet=%s", text[:120])
 
     def build_vision_messages(
-        self, local_path: str, layout_markdown: str
+        self,
+        local_path: str,
+        layout_markdown: str,
+        *,
+        schema: DocumentSchema | None = None,
+        registry: SchemaRegistry | None = None,
     ) -> list[dict[str, Any]]:
+        if schema is not None:
+            reg = registry or SchemaRegistry()
+            system = reg.build_extraction_system_prompt(schema)
+            user = reg.build_extraction_user_prompt(
+                schema,
+                layout_markdown,
+                layout_max_chars=self._layout_max_chars,
+            )
+        else:
+            system = (
+                "You are a document OCR and extraction engine. "
+                "Read the attached page image(s) and bundled layout text. "
+                "Return only valid JSON matching the required schema."
+            )
+            user = self._bundle_layout_prompt(layout_markdown)
+
         return [
-            {
-                "role": "system",
-                "content": (
-                    "You are a document OCR and extraction engine. "
-                    "Read the attached page image(s) and bundled layout text. "
-                    "Return only valid JSON matching the required schema."
-                ),
-            },
+            {"role": "system", "content": system},
             {
                 "role": "user",
-                "content": self._bundle_layout_prompt(layout_markdown),
+                "content": user,
                 "images": self.encode_images_base64(local_path),
             },
         ]

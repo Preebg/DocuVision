@@ -1,0 +1,33 @@
+# Semantic field contract — medical patient intake (not a pixel layout template).
+class_id: medical_intake
+display_name: Medical Intake Form
+classification_keywords:
+  - patient
+  - date of birth
+  - dob
+  - provider
+  - intake
+  - medical history
+  - insurance
+  - symptoms
+  - physician
+  - clinic
+  - mrn
+  - chief complaint
+  - allergy
+fields:
+  - name: patient_name
+    type: string
+    description_prompt: >
+      Full legal name of the patient as written on the form
+      (Patient Name / Name of Patient).
+  - name: dob
+    type: string
+    description_prompt: >
+      Patient date of birth exactly as printed (normalize to YYYY-MM-DD when
+      unambiguous; otherwise keep the source format).
+  - name: provider
+    type: string
+    description_prompt: >
+      Attending physician, clinic, or healthcare provider name associated
+      with this intake (Provider / Doctor / Clinic).

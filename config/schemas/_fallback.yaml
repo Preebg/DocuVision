@@ -1,0 +1,20 @@
+# Catch-all semantic contract when no document class matches confidently.
+class_id: unclassified
+display_name: Unclassified Document
+classification_keywords: []
+fields:
+  - name: document_title
+    type: string
+    description_prompt: >
+      Best short title or heading for the document (first prominent heading
+      or form name). Use empty string only if none is visible.
+  - name: summary
+    type: string
+    description_prompt: >
+      One or two sentences summarizing what this document is about and its
+      apparent purpose.
+  - name: full_text_ocr
+    type: string
+    description_prompt: >
+      Exhaustive OCR transcript of every readable word on the page(s),
+      preserving reading order as much as possible.

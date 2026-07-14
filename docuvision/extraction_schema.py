@@ -1,4 +1,4 @@
-"""Strict extraction JSON Schema — local-only, no cloud config dependency."""
+"""Strict extraction JSON Schema — local-only, schema-registry compatible."""
 
 from __future__ import annotations
 
@@ -16,13 +16,17 @@ class ValidationError(Exception):
         self.cause = cause
 
 
+# Stable pipeline envelope after SchemaRegistry.normalize_extraction.
+# Accepts both modern class-routed payloads and legacy medical top-level keys.
 EXTRACTION_JSON_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-        "patient_name": {"type": "string", "minLength": 1},
-        "dob": {"type": "string", "minLength": 1},
+        "class_id": {"type": "string", "minLength": 1},
         "form_type": {"type": "string", "minLength": 1},
+        "display_name": {"type": "string"},
+        "patient_name": {"type": "string"},
+        "dob": {"type": "string"},
         "extracted_payload": {
             "type": "object",
             "properties": {
@@ -34,8 +38,8 @@ EXTRACTION_JSON_SCHEMA: dict[str, Any] = {
             "additionalProperties": True,
         },
     },
-    "required": ["patient_name", "dob", "form_type", "extracted_payload"],
-    "additionalProperties": False,
+    "required": ["form_type", "extracted_payload"],
+    "additionalProperties": True,
 }
 
 
@@ -75,6 +79,13 @@ def is_empty_extraction(parsed_json: dict[str, Any]) -> bool:
             for value in payload.values()
             if isinstance(value, (str, int, float))
         ]
+        fields = payload.get("fields")
+        if isinstance(fields, dict):
+            text_values.extend(
+                str(value).strip()
+                for value in fields.values()
+                if isinstance(value, (str, int, float))
+            )
         return not any(text_values)
 
     return False

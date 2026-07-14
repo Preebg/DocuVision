@@ -108,6 +108,22 @@ class Settings(BaseSettings):
         ),
     )
 
+    # -- Pillar 3: semantic schema routing --------------------------------
+    schemas_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Directory of semantic schema YAML files. "
+            "Env: DOCUVISION_SCHEMAS_DIR. Defaults to ``<repo>/config/schemas``."
+        ),
+    )
+    classification_use_llm: bool = Field(
+        default=True,
+        description=(
+            "When keyword routing is inconclusive, run a lightweight text-only "
+            "LLM classify call (classify_router.md). Disable on ultra-low RAM."
+        ),
+    )
+
     @field_validator("ollama_base_url")
     @classmethod
     def _normalize_ollama_url(cls, value: str) -> str:
@@ -146,6 +162,12 @@ class Settings(BaseSettings):
 
     def resolved_sqlite_path(self) -> Path:
         return self.sqlite_path or (self.data_root / "docuvision.db")
+
+    def resolved_schemas_dir(self) -> Path:
+        if self.schemas_dir is not None:
+            return self.schemas_dir
+        # docuvision/config/settings.py → repo root / config / schemas
+        return Path(__file__).resolve().parents[2] / "config" / "schemas"
 
     def ensure_directories(self) -> None:
         """Create the on-prem directory tree if missing."""

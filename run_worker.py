@@ -21,6 +21,7 @@ from docuvision.adapters.ollama_client import OllamaVisionClient
 from docuvision.composition import build_backends
 from docuvision.config.settings import Settings, get_settings
 from docuvision.core.pipeline import DocumentPipeline
+from docuvision.registry.schema_registry import SchemaRegistry
 from docuvision.stages.layout import DoclingLayoutStage
 from docuvision.stages.vision_extraction import VisionExtractionStage
 
@@ -36,7 +37,12 @@ def build_pipeline(
     storage, repository = build_backends(settings)
     layout = DoclingLayoutStage()
     vision_client = ollama or OllamaVisionClient(settings)
-    vision = VisionExtractionStage(vision_client)
+    registry = SchemaRegistry(settings.resolved_schemas_dir())
+    vision = VisionExtractionStage(
+        vision_client,
+        registry=registry,
+        use_llm_classification=settings.classification_use_llm,
+    )
 
     return DocumentPipeline(
         storage=storage,
@@ -104,6 +110,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         logger.info("repository=sqlite path=%s", settings.resolved_sqlite_path())
     logger.info("ollama_base_url=%s", settings.ollama_base_url)
+    logger.info("schemas_dir=%s", settings.resolved_schemas_dir())
+    logger.info("classification_use_llm=%s", settings.classification_use_llm)
 
     settings.ensure_directories()
     ollama = OllamaVisionClient(settings)

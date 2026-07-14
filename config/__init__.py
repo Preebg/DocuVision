@@ -32,7 +32,7 @@ def load_supabase_credentials() -> tuple[str, str]:
     key = os.getenv("SUPABASE_KEY")
 
     if not url or not key:
-        secrets_path = Path(__file__).with_name("secrets.toml")
+        secrets_path = Path(__file__).resolve().parent.parent / "secrets.toml"
         if secrets_path.exists():
             with secrets_path.open("rb") as secrets_file:
                 secrets = tomllib.load(secrets_file)

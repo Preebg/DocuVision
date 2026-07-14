@@ -1,0 +1,33 @@
+# Semantic field contract — commercial invoice (not a pixel layout template).
+class_id: commercial_invoice
+display_name: Commercial Invoice
+classification_keywords:
+  - invoice
+  - bill to
+  - remittance
+  - purchase order
+  - po number
+  - amount due
+  - subtotal
+  - tax
+  - vendor
+  - invoice number
+  - qty
+  - unit price
+fields:
+  - name: invoice_number
+    type: string
+    description_prompt: >
+      The unique invoice identifier / invoice number printed on the document
+      (often near the header, labeled Invoice #, Inv No, or similar).
+  - name: vendor
+    type: string
+    description_prompt: >
+      The seller / supplier / vendor company name issuing the invoice
+      (not the bill-to customer).
+  - name: total_amount
+    type: string
+    description_prompt: >
+      The final total amount due, including currency symbol if present
+      (Grand Total / Amount Due / Total). Prefer the settlement total over
+      line subtotals.

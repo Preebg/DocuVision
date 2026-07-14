@@ -13,13 +13,14 @@ import {
 import {
   buildVerifiedPayload,
   DocumentPipelineRow,
+  emptyVerificationFields,
+  fieldKeysForPayload,
   getFieldValue,
   getOperatorIdentity,
   INGESTION_STEP_LABELS,
   normalizeExtractedPayload,
   PipelineStatus,
   PipelineStatusType,
-  VERIFICATION_FIELD_KEYS,
   VerificationFieldKey,
 } from "@/lib/types";
 
@@ -44,11 +45,9 @@ export function VerificationDashboard() {
   const [queueLoading, setQueueLoading] = useState(true);
   const [documentUrl, setDocumentUrl] = useState<string | null>(null);
   const [documentLoading, setDocumentLoading] = useState(false);
-  const [fields, setFields] = useState<Record<VerificationFieldKey, string>>({
-    "Applicant Name": "",
-    "ID Number": "",
-    "Document Date": "",
-  });
+  const [fields, setFields] = useState<Record<VerificationFieldKey, string>>(
+    emptyVerificationFields,
+  );
   const [actionLoading, setActionLoading] = useState<"approve" | "reject" | null>(
     null,
   );
@@ -62,13 +61,11 @@ export function VerificationDashboard() {
     null;
 
   const populateFields = useCallback((item: DocumentPipelineRow) => {
-    const nextFields = VERIFICATION_FIELD_KEYS.reduce(
-      (acc, key) => {
-        acc[key] = getFieldValue(item.extracted_payload, key);
-        return acc;
-      },
-      {} as Record<VerificationFieldKey, string>,
-    );
+    const keys = fieldKeysForPayload(item.extracted_payload);
+    const nextFields = emptyVerificationFields();
+    for (const key of keys) {
+      nextFields[key] = getFieldValue(item.extracted_payload, key);
+    }
     setFields(nextFields);
   }, []);
 
@@ -124,11 +121,7 @@ export function VerificationDashboard() {
     if (!selectedId) {
       setDocumentUrl(null);
       setDocumentLoading(false);
-      setFields({
-        "Applicant Name": "",
-        "ID Number": "",
-        "Document Date": "",
-      });
+      setFields(emptyVerificationFields());
       return;
     }
 
@@ -328,22 +321,24 @@ export function VerificationDashboard() {
               {isReviewReady && (
                 <>
                   <div className="space-y-4">
-                    {VERIFICATION_FIELD_KEYS.map((key) => (
+                    {fieldKeysForPayload(selectedItem.extracted_payload).map(
+                      (key) => (
                       <label key={key} className="block">
                         <span className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-muted">
-                          {key}
+                          {key.replaceAll("_", " ")}
                         </span>
                         <input
                           type="text"
-                          value={fields[key]}
+                          value={fields[key] ?? ""}
                           onChange={(event) =>
                             handleFieldChange(key, event.target.value)
                           }
                           className="w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm text-foreground outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/20"
-                          placeholder={`Enter ${key.toLowerCase()}…`}
+                          placeholder={`Enter ${key.replaceAll("_", " ").toLowerCase()}…`}
                         />
                       </label>
-                    ))}
+                    ),
+                    )}
                   </div>
 
                   {normalizeExtractedPayload(selectedItem.extracted_payload)
