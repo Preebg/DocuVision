@@ -98,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("processed=%s", settings.resolved_processed_dir())
     logger.info("failed=%s", settings.resolved_failed_dir())
     logger.info("verification=%s", settings.resolved_verification_dir())
+    logger.info("release=%s", settings.resolved_release_dir())
     if settings.database_url:
         logger.info("repository=postgres")
     else:

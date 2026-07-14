@@ -11,6 +11,7 @@ from typing import Any, BinaryIO, Protocol, Sequence, runtime_checkable
 
 from docuvision.core.models import (
     Batch,
+    BatchStatus,
     BatchSummary,
     DocumentJob,
     DocumentPage,
@@ -90,6 +91,37 @@ class PipelineRepository(Protocol):
         """Return non-terminal batches for the supervisor queue view.
 
         Ordered by priority (HIGH first), then ``created_at`` ascending.
+        """
+        ...
+
+    def get_batch(self, batch_id: str) -> Batch | None:
+        """Load a batch with ordered document links, or ``None`` if missing."""
+        ...
+
+    def list_batches_for_document(self, document_id: str) -> list[Batch]:
+        """Return batches that include ``document_id`` (ordered membership)."""
+        ...
+
+    def update_batch_status(
+        self,
+        batch_id: str,
+        status: BatchStatus,
+        *,
+        actor: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> Batch:
+        """Persist a batch status transition and return the updated batch."""
+        ...
+
+    def list_document_pages(self, document_id: str) -> list[DocumentPage]:
+        """Return ordered page fragments for a document (may be empty)."""
+        ...
+
+    def maybe_mark_batches_ready_for_hitl(self, document_id: str) -> list[Batch]:
+        """Advance parent ``processing`` batches to ``ready_for_hitl`` when due.
+
+        A batch qualifies when every linked document is
+        ``PENDING_VERIFICATION`` or ``VERIFIED``.
         """
         ...
 

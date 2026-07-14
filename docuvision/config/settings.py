@@ -50,6 +50,13 @@ class Settings(BaseSettings):
         default=None,
         description="Scratch copies during processing. Defaults to ``{data_root}/workspace``.",
     )
+    release_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Air-gapped enterprise release drop root (network share mount). "
+            "Env: DOCUVISION_RELEASE_DIR. Defaults to ``{data_root}/release``."
+        ),
+    )
 
     # -- persistence ------------------------------------------------------
     database_url: str | None = Field(
@@ -134,6 +141,9 @@ class Settings(BaseSettings):
     def resolved_workspace_dir(self) -> Path:
         return self.workspace_dir or (self.data_root / "workspace")
 
+    def resolved_release_dir(self) -> Path:
+        return self.release_dir or (self.data_root / "release")
+
     def resolved_sqlite_path(self) -> Path:
         return self.sqlite_path or (self.data_root / "docuvision.db")
 
@@ -145,6 +155,7 @@ class Settings(BaseSettings):
             self.resolved_failed_dir(),
             self.resolved_verification_dir(),
             self.resolved_workspace_dir(),
+            self.resolved_release_dir(),
         ):
             path.mkdir(parents=True, exist_ok=True)
         self.resolved_sqlite_path().parent.mkdir(parents=True, exist_ok=True)

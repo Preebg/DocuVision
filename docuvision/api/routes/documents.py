@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import mimetypes
 import re
 from pathlib import Path
@@ -11,13 +12,15 @@ from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from docuvision.adapters.local_storage import PROCESSABLE_SUFFIXES, LocalStorageAdapter
-from docuvision.api.deps import get_repository, get_storage
+from docuvision.api.deps import get_release_engine, get_repository, get_storage
 from docuvision.api.schemas import DocumentJobOut, DocumentPatchRequest, IngestResponse
 from docuvision.api.serializers import job_to_out
 from docuvision.core.contracts import PipelineRepository
 from docuvision.core.models import PipelineStatus
+from docuvision.core.release import ReleaseEngine
 
 router = APIRouter(tags=["documents"])
+logger = logging.getLogger(__name__)
 
 _SAFE_NAME = re.compile(r"[^a-zA-Z0-9._-]+")
 _OPERATOR_HEADER = "X-Operator-Identity"
@@ -155,10 +158,11 @@ def stream_document_file(
 
 
 @router.patch("/api/documents/{job_id}", response_model=DocumentJobOut)
-def patch_document(
+async def patch_document(
     job_id: str,
     body: DocumentPatchRequest,
     repository: PipelineRepository = Depends(get_repository),
+    release_engine: ReleaseEngine = Depends(get_release_engine),
     x_operator_identity: str | None = Header(default=None, alias=_OPERATOR_HEADER),
 ) -> DocumentJobOut:
     job = repository.get_job(job_id)
@@ -201,6 +205,25 @@ def patch_document(
                 else None,
             ),
         )
+        # Pillar 5: when the full batch is clerk-verified, release to the share.
+        try:
+            released = await release_engine.release_after_document_verified(
+                job_id,
+                actor=actor,
+            )
+            for batch in released:
+                logger.info(
+                    "api.release batch_id=%s status=%s",
+                    batch.id,
+                    batch.status.value,
+                )
+        except Exception:
+            # Export failures are handled inside ReleaseEngine (→ release_failed).
+            # Unexpected orchestration errors must not undo clerk VERIFIED work.
+            logger.exception(
+                "api.release_hook_failed document_id=%s",
+                job_id,
+            )
     else:
         reject_reason = body.reject_reason or "UNREADABLE_DOCUMENT"
         # Preserve any clerk field overrides even on reject for non-repudiation.

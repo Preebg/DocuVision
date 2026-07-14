@@ -10,6 +10,7 @@ from docuvision.core.errors import (
     FatalProcessingError,
     InfrastructureError,
     PipelineError,
+    ReleaseExportError,
     TransientError,
     ValidationError,
 )
@@ -31,6 +32,7 @@ from docuvision.core.observability import (
     configure_json_logger,
 )
 from docuvision.core.pipeline import DocumentPipeline
+from docuvision.core.release import ReleaseEngine
 
 # Deprecated aliases — prefer the taxonomy in errors.py.
 LayoutStageError = ValidationError
@@ -58,6 +60,8 @@ __all__ = [
     "PipelineRepository",
     "PipelineResult",
     "PipelineStatus",
+    "ReleaseEngine",
+    "ReleaseExportError",
     "RepositoryError",
     "StagingError",
     "StorageBackend",

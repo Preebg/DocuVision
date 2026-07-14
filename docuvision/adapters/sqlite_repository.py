@@ -243,6 +243,136 @@ class SqlitePipelineRepository:
             ).fetchall()
         return [self._row_to_batch_summary(row) for row in rows]
 
+    def get_batch(self, batch_id: str) -> Batch | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            links = self._load_batch_links(connection, batch_id)
+        batch = self._row_to_batch(row)
+        batch.documents = links
+        return batch
+
+    def list_batches_for_document(self, document_id: str) -> list[Batch]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT b.*
+                FROM batches b
+                INNER JOIN batch_documents bd ON bd.batch_id = b.id
+                WHERE bd.document_id = ?
+                ORDER BY b.created_at ASC
+                """,
+                (document_id,),
+            ).fetchall()
+            batches: list[Batch] = []
+            for row in rows:
+                batch = self._row_to_batch(row)
+                batch.documents = self._load_batch_links(connection, batch.id)
+                batches.append(batch)
+        return batches
+
+    def update_batch_status(
+        self,
+        batch_id: str,
+        status: BatchStatus,
+        *,
+        actor: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> Batch:
+        batch = self.get_batch(batch_id)
+        if batch is None:
+            raise KeyError(f"Batch not found: {batch_id}")
+        from_status = batch.status.value
+        now = _utc_iso()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE batches
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status.value, now, batch_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Batch not found: {batch_id}")
+            if batch.documents:
+                self._insert_event(
+                    connection,
+                    job_id=batch.documents[0].document_id,
+                    action="BATCH_STATUS_TRANSITION",
+                    from_status=from_status,
+                    to_status=status.value,
+                    details={
+                        "batch_id": batch_id,
+                        "batch_name": batch.name,
+                        **(details or {}),
+                    },
+                    actor=actor if actor is not None else self._actor,
+                )
+        updated = self.get_batch(batch_id)
+        if updated is None:
+            raise KeyError(f"Batch not found after update: {batch_id}")
+        logger.info(
+            "sqlite.update_batch_status id=%s %s→%s",
+            batch_id,
+            from_status,
+            status.value,
+        )
+        return updated
+
+    def list_document_pages(self, document_id: str) -> list[DocumentPage]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, document_id, page_no, file_path
+                FROM document_pages
+                WHERE document_id = ?
+                ORDER BY page_no ASC
+                """,
+                (document_id,),
+            ).fetchall()
+        return [
+            DocumentPage(
+                id=row["id"],
+                document_id=row["document_id"],
+                page_no=int(row["page_no"]),
+                file_path=row["file_path"],
+            )
+            for row in rows
+        ]
+
+    def maybe_mark_batches_ready_for_hitl(self, document_id: str) -> list[Batch]:
+        advanced: list[Batch] = []
+        for batch in self.list_batches_for_document(document_id):
+            if batch.status != BatchStatus.PROCESSING:
+                continue
+            if not batch.documents:
+                continue
+            ready = True
+            for link in batch.documents:
+                job = self.get_job(link.document_id)
+                if job is None or job.status.value not in {
+                    PipelineStatus.PENDING_VERIFICATION.value,
+                    PipelineStatus.VERIFIED.value,
+                }:
+                    ready = False
+                    break
+            if not ready:
+                continue
+            advanced.append(
+                self.update_batch_status(
+                    batch.id,
+                    BatchStatus.READY_FOR_HITL,
+                    actor=self._actor,
+                    details={"trigger_document_id": document_id},
+                )
+            )
+        return advanced
+
     def add_document_pages(
         self,
         document_id: str,
@@ -613,3 +743,40 @@ class SqlitePipelineRepository:
             created_at=_parse_dt(row["created_at"]),
             updated_at=_parse_dt(row["updated_at"]),
         )
+
+    @staticmethod
+    def _row_to_batch(row: sqlite3.Row) -> Batch:
+        return Batch(
+            id=row["id"],
+            name=row["name"],
+            priority=int(row["priority"]),
+            status=BatchStatus(row["status"]),
+            source_id=row["source_id"],
+            created_at=_parse_dt(row["created_at"]),
+            updated_at=_parse_dt(row["updated_at"]),
+            documents=[],
+        )
+
+    @staticmethod
+    def _load_batch_links(
+        connection: sqlite3.Connection,
+        batch_id: str,
+    ) -> list[BatchDocumentLink]:
+        rows = connection.execute(
+            """
+            SELECT bd.document_id, bd.sequence_no, d.filename
+            FROM batch_documents bd
+            INNER JOIN documents d ON d.id = bd.document_id
+            WHERE bd.batch_id = ?
+            ORDER BY bd.sequence_no ASC
+            """,
+            (batch_id,),
+        ).fetchall()
+        return [
+            BatchDocumentLink(
+                document_id=row["document_id"],
+                sequence_no=int(row["sequence_no"]),
+                file_name=row["filename"],
+            )
+            for row in rows
+        ]

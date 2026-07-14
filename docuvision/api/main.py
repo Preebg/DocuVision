@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from docuvision.adapters.postgres_repository import PostgresPipelineRepository
 from docuvision.api.routes import batches, documents, queue
 from docuvision.api.schemas import HealthResponse
-from docuvision.composition import build_backends
+from docuvision.composition import build_backends, build_release_engine, build_release_exporter
 from docuvision.config.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -27,14 +27,24 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     storage, repository = build_backends(settings)
+    release_exporter = build_release_exporter(settings)
+    release_engine = build_release_engine(
+        settings,
+        storage,
+        repository,
+        exporter=release_exporter,
+    )
     app.state.settings = settings
     app.state.storage = storage
     app.state.repository = repository
+    app.state.release_exporter = release_exporter
+    app.state.release_engine = release_engine
     app.state.repository_kind = "postgres" if settings.database_url else "sqlite"
     logger.info(
-        "api.ready repository=%s data_root=%s",
+        "api.ready repository=%s data_root=%s release_dir=%s",
         app.state.repository_kind,
         settings.data_root,
+        settings.resolved_release_dir(),
     )
     try:
         yield

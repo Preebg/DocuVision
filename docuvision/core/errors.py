@@ -30,3 +30,11 @@ class InfrastructureError(PipelineError):
 
 class FatalProcessingError(PipelineError):
     """Unrecoverable processing failures that must not be retried blindly."""
+
+
+class ReleaseExportError(InfrastructureError):
+    """Filesystem / network-mount failure while exporting a verified batch.
+
+    Catchable by the release orchestrator so the worker/API loop stays up and
+    the batch transitions to ``release_failed`` for automated retry.
+    """

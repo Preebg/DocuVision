@@ -249,6 +249,22 @@ class DocumentPipeline:
             "pipeline.state → %s",
             PipelineStatus.PENDING_VERIFICATION.value,
         )
+        # Batch domain: when every member is HITL-ready, advance to ready_for_hitl.
+        try:
+            advanced = self._repository.maybe_mark_batches_ready_for_hitl(job.id)
+            for batch in advanced:
+                job_log.info(
+                    "pipeline.batch_ready_for_hitl batch_id=%s name=%s",
+                    batch.id,
+                    batch.name,
+                )
+        except Exception as exc:
+            # Never fail document staging because of a batch status race.
+            job_log.warning(
+                "pipeline.batch_ready_for_hitl_failed document_id=%s error=%s",
+                job.id,
+                exc,
+            )
         return job
 
     # -- helpers -----------------------------------------------------------

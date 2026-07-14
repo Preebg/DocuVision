@@ -6,7 +6,8 @@
 --   TIMESTAMPTZ     → TEXT ISO-8601 UTC timestamps, DEFAULT CURRENT_TIMESTAMP
 --
 -- Batch status values must match contracts/batch-status.json
---   ingested | processing | ready_for_hitl | completed | failed
+--   ingested | processing | ready_for_hitl | releasing | released
+--   | release_failed | completed | failed
 --
 -- Priority: 1=Low, 2=Med (default), 3=High
 

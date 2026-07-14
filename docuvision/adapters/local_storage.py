@@ -29,6 +29,7 @@ class LocalStorageAdapter:
         verification/  — HITL review staging
         processed/     — successful archive
         failed/        — dead-letter
+        release/       — enterprise share drop (Pillar 5; optional override)
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -37,6 +38,7 @@ class LocalStorageAdapter:
         self._verification = settings.resolved_verification_dir()
         self._processed = settings.resolved_processed_dir()
         self._failed = settings.resolved_failed_dir()
+        self._release = settings.resolved_release_dir()
         self.ensure_directories()
 
     def ensure_directories(self) -> None:
@@ -46,6 +48,7 @@ class LocalStorageAdapter:
             self._verification,
             self._processed,
             self._failed,
+            self._release,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -130,15 +133,14 @@ class LocalStorageAdapter:
         *,
         prefer_verification: bool = True,
     ) -> Path:
-        """Locate a document under verification and/or incoming (basename-safe).
+        """Locate a document under verification / processed / incoming.
 
         Raises ``FileNotFoundError`` when no matching file exists.
         """
-        roots = (
-            (self._verification, self._incoming)
-            if prefer_verification
-            else (self._incoming, self._verification)
-        )
+        if prefer_verification:
+            roots = (self._verification, self._processed, self._incoming)
+        else:
+            roots = (self._incoming, self._verification, self._processed)
         for root in roots:
             candidate = self._safe_join(root, file_name)
             if candidate.is_file():

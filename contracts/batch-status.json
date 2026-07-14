@@ -3,6 +3,9 @@
     "INGESTED": "ingested",
     "PROCESSING": "processing",
     "READY_FOR_HITL": "ready_for_hitl",
+    "RELEASING": "releasing",
+    "RELEASED": "released",
+    "RELEASE_FAILED": "release_failed",
     "COMPLETED": "completed",
     "FAILED": "failed"
   },
