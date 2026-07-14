@@ -79,7 +79,7 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-PRIMARY_MODEL = os.getenv("OLLAMA_PRIMARY_MODEL", "qwen3-vl:8b-thinking")
+PRIMARY_MODEL = os.getenv("OLLAMA_PRIMARY_MODEL", "qwen3-vl:8b")
 FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5vl:3b")
 # Aligned with contracts/pipeline-status.json (QUEUED replaces legacy IMPORTED).
 PIPELINE_STATUS_QUEUED = "QUEUED"
@@ -124,7 +124,7 @@ OLLAMA_INFERENCE_OPTIONS = {
 def get_ollama_config() -> dict[str, Any]:
     return {
         "url": os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/"),
-        "timeout": int(os.getenv("OLLAMA_TIMEOUT", "300")),
+        "timeout": int(os.getenv("OLLAMA_TIMEOUT", "600")),
         "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "8192")),
         "image_max_dimension": int(os.getenv("OLLAMA_IMAGE_MAX_DIMENSION", "1280")),
         "json_mode": os.getenv("OLLAMA_JSON_MODE", "true").lower() in {"1", "true", "yes"},
