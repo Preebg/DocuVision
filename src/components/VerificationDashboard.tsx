@@ -1,10 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { DocumentViewer } from "@/components/DocumentViewer";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { IncomingDropzone } from "@/components/IncomingDropzone";
+import { PdfJsViewer, type PdfFieldHighlight } from "@/components/PdfJsViewer";
 import { PipelinePhaseStepper } from "@/components/PipelinePhaseStepper";
 import { QueueClearState } from "@/components/QueueClearState";
+import { useOperatorHotkeys } from "@/hooks/useOperatorHotkeys";
 import {
   documentFileUrl,
   fetchQueue,
@@ -12,20 +20,26 @@ import {
 } from "@/lib/api";
 import {
   buildVerifiedPayload,
+  CONFIDENCE_OK_THRESHOLD,
   DocumentPipelineRow,
+  draftStorageKey,
   emptyVerificationFields,
   fieldKeysForPayload,
+  getFieldBBoxes,
+  getFieldConfidence,
   getFieldValue,
   getOperatorIdentity,
   INGESTION_STEP_LABELS,
   normalizeExtractedPayload,
   PipelineStatus,
   PipelineStatusType,
+  REJECT_REASONS,
+  type RejectReasonValue,
   VerificationFieldKey,
 } from "@/lib/types";
 
-const REJECT_REASON = "UNREADABLE_DOCUMENT";
 const POLL_MS = 2500;
+const SUCCESS_FLASH_MS = 700;
 
 function stepLabel(status: PipelineStatusType | null | undefined): string {
   if (status && status in INGESTION_STEP_LABELS) {
@@ -48,17 +62,51 @@ export function VerificationDashboard() {
   const [fields, setFields] = useState<Record<VerificationFieldKey, string>>(
     emptyVerificationFields,
   );
+  const [activeFieldKey, setActiveFieldKey] =
+    useState<VerificationFieldKey | null>(null);
   const [actionLoading, setActionLoading] = useState<"approve" | "reject" | null>(
     null,
   );
   const [actionError, setActionError] = useState<string | null>(null);
+  const [draftSavedAt, setDraftSavedAt] = useState<number | null>(null);
+  const [successFlash, setSuccessFlash] = useState(false);
+  const [rejectOpen, setRejectOpen] = useState(false);
+  const [rejectReason, setRejectReason] =
+    useState<RejectReasonValue>("UNREADABLE_DOCUMENT");
+
   const pendingRef = useRef(pendingVerification);
-  pendingRef.current = pendingVerification;
+  const fieldRefs = useRef<Map<VerificationFieldKey, HTMLInputElement>>(
+    new Map(),
+  );
+  const reviewPaneRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    pendingRef.current = pendingVerification;
+  }, [pendingVerification]);
 
   const selectedItem =
     pendingVerification.find((row) => row.id === selectedId) ??
     pendingVerification[0] ??
     null;
+
+  const visibleFieldKeys = useMemo(
+    () =>
+      selectedItem
+        ? fieldKeysForPayload(selectedItem.extracted_payload)
+        : [],
+    [selectedItem],
+  );
+
+  const highlights: PdfFieldHighlight[] = useMemo(() => {
+    if (!selectedItem) {
+      return [];
+    }
+    const boxes = getFieldBBoxes(selectedItem.extracted_payload);
+    return Object.entries(boxes).map(([key, bbox]) => ({
+      key,
+      bbox: bbox!,
+    }));
+  }, [selectedItem]);
 
   const populateFields = useCallback((item: DocumentPipelineRow) => {
     const keys = fieldKeysForPayload(item.extracted_payload);
@@ -66,7 +114,27 @@ export function VerificationDashboard() {
     for (const key of keys) {
       nextFields[key] = getFieldValue(item.extracted_payload, key);
     }
+
+    // Restore local draft if the clerk previously hit Ctrl+S on this job.
+    try {
+      const raw = window.localStorage.getItem(draftStorageKey(item.id));
+      if (raw) {
+        const draft = JSON.parse(raw) as Partial<
+          Record<VerificationFieldKey, string>
+        >;
+        for (const key of keys) {
+          if (typeof draft[key] === "string") {
+            nextFields[key] = draft[key]!;
+          }
+        }
+      }
+    } catch {
+      // Ignore corrupt drafts.
+    }
+
     setFields(nextFields);
+    setActiveFieldKey(keys[0] ?? null);
+    setDraftSavedAt(null);
   }, []);
 
   const refreshQueues = useCallback(
@@ -107,6 +175,8 @@ export function VerificationDashboard() {
 
   useEffect(() => {
     const controller = new AbortController();
+    // Queue poll is intentional external sync for the HITL station.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch on mount + interval
     void refreshQueues(controller.signal);
     const poll = window.setInterval(() => {
       void refreshQueues();
@@ -119,9 +189,11 @@ export function VerificationDashboard() {
 
   useEffect(() => {
     if (!selectedId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset review pane when queue empties
       setDocumentUrl(null);
       setDocumentLoading(false);
       setFields(emptyVerificationFields());
+      setActiveFieldKey(null);
       return;
     }
 
@@ -139,8 +211,59 @@ export function VerificationDashboard() {
     setFields((current) => ({ ...current, [key]: value }));
   };
 
-  const handleApprove = async () => {
-    if (!selectedItem) {
+  const focusFieldAtIndex = useCallback(
+    (index: number) => {
+      const key = visibleFieldKeys[index];
+      if (!key) {
+        return;
+      }
+      setActiveFieldKey(key);
+      const node = fieldRefs.current.get(key);
+      node?.focus();
+      node?.select();
+    },
+    [visibleFieldKeys],
+  );
+
+  const navigateDocument = useCallback(
+    (delta: number) => {
+      const list = pendingRef.current;
+      if (list.length === 0) {
+        return;
+      }
+      const currentIndex = list.findIndex((row) => row.id === selectedId);
+      const base = currentIndex >= 0 ? currentIndex : 0;
+      const nextIndex = Math.max(0, Math.min(list.length - 1, base + delta));
+      setSelectedId(list[nextIndex]!.id);
+    },
+    [selectedId],
+  );
+
+  const flashSuccessAndAdvance = useCallback(
+    async (opts?: { flash?: boolean }) => {
+      if (opts?.flash !== false) {
+        setSuccessFlash(true);
+        window.setTimeout(() => setSuccessFlash(false), SUCCESS_FLASH_MS);
+      }
+      const releasedId = selectedId;
+      await refreshQueues();
+      // Prefer the next pending item rather than re-selecting the released job.
+      setSelectedId((current) => {
+        const list = pendingRef.current.filter((row) => row.id !== releasedId);
+        if (list.length === 0) {
+          return null;
+        }
+        if (current && list.some((row) => row.id === current)) {
+          return current;
+        }
+        return list[0]!.id;
+      });
+    },
+    [refreshQueues, selectedId],
+  );
+
+  const handleApprove = useCallback(async () => {
+    if (!selectedItem || actionLoading) {
       return;
     }
 
@@ -159,7 +282,12 @@ export function VerificationDashboard() {
         verified_by: operator,
         actor: operator,
       });
-      await refreshQueues();
+      try {
+        window.localStorage.removeItem(draftStorageKey(selectedItem.id));
+      } catch {
+        // ignore
+      }
+      await flashSuccessAndAdvance();
     } catch (err) {
       setActionError(
         err instanceof Error ? err.message : "Failed to approve document.",
@@ -167,10 +295,10 @@ export function VerificationDashboard() {
     } finally {
       setActionLoading(null);
     }
-  };
+  }, [actionLoading, fields, flashSuccessAndAdvance, selectedItem]);
 
-  const handleReject = async () => {
-    if (!selectedItem) {
+  const handleRejectConfirm = useCallback(async () => {
+    if (!selectedItem || actionLoading) {
       return;
     }
 
@@ -179,19 +307,24 @@ export function VerificationDashboard() {
 
     try {
       const operator = getOperatorIdentity();
-      // Include any in-progress field corrections for the audit trail.
       const verifiedPayload = buildVerifiedPayload(
         fields,
         selectedItem.extracted_payload,
       );
       await patchDocument(selectedItem.id, {
         action: "reject",
-        reject_reason: REJECT_REASON,
+        reject_reason: rejectReason,
         verified_payload: verifiedPayload,
         verified_by: operator,
         actor: operator,
       });
-      await refreshQueues();
+      try {
+        window.localStorage.removeItem(draftStorageKey(selectedItem.id));
+      } catch {
+        // ignore
+      }
+      setRejectOpen(false);
+      await flashSuccessAndAdvance({ flash: false });
     } catch (err) {
       setActionError(
         err instanceof Error ? err.message : "Failed to reject document.",
@@ -199,17 +332,76 @@ export function VerificationDashboard() {
     } finally {
       setActionLoading(null);
     }
-  };
+  }, [
+    actionLoading,
+    fields,
+    flashSuccessAndAdvance,
+    rejectReason,
+    selectedItem,
+  ]);
+
+  const handleSaveDraft = useCallback(() => {
+    if (!selectedItem) {
+      return;
+    }
+    try {
+      const keys = fieldKeysForPayload(selectedItem.extracted_payload);
+      const draft: Partial<Record<VerificationFieldKey, string>> = {};
+      for (const key of keys) {
+        draft[key] = fields[key] ?? "";
+      }
+      window.localStorage.setItem(
+        draftStorageKey(selectedItem.id),
+        JSON.stringify(draft),
+      );
+      setDraftSavedAt(Date.now());
+      setActionError(null);
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : "Failed to save local draft.",
+      );
+    }
+  }, [fields, selectedItem]);
+
+  const handleEscape = useCallback(() => {
+    if (rejectOpen) {
+      setRejectOpen(false);
+      return;
+    }
+    const active = document.activeElement;
+    if (active instanceof HTMLElement) {
+      active.blur();
+    }
+    setActiveFieldKey(null);
+  }, [rejectOpen]);
 
   const isReviewReady =
     selectedItem?.status === PipelineStatus.PENDING_VERIFICATION;
+
+  useOperatorHotkeys({
+    enabled: (isReviewReady && actionLoading === null) || rejectOpen,
+    onApproveRelease: rejectOpen ? undefined : () => void handleApprove(),
+    onReject: rejectOpen ? undefined : () => setRejectOpen(true),
+    onNextDocument: rejectOpen ? undefined : () => navigateDocument(1),
+    onPrevDocument: rejectOpen ? undefined : () => navigateDocument(-1),
+    onFocusField: rejectOpen ? undefined : focusFieldAtIndex,
+    onSaveDraft: rejectOpen ? undefined : handleSaveDraft,
+    onEscape: handleEscape,
+  });
+
   const stepperStatus =
     selectedItem?.status ?? activeIngestion[0]?.status ?? null;
   const stepperFileName =
     selectedItem?.file_name ?? activeIngestion[0]?.file_name ?? null;
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div
+      className={`flex h-full min-h-0 flex-col transition-[box-shadow] duration-300 ${
+        successFlash
+          ? "shadow-[inset_0_0_0_3px_var(--success)]"
+          : "shadow-[inset_0_0_0_0_transparent]"
+      }`}
+    >
       <IncomingDropzone onUploaded={() => void refreshQueues()} />
       <PipelinePhaseStepper status={stepperStatus} fileName={stepperFileName} />
 
@@ -246,7 +438,7 @@ export function VerificationDashboard() {
 
         <QueuePanel
           title="Pending Verification Queue"
-          subtitle="Awaiting clerk review"
+          subtitle="J/K navigate · Ctrl+Enter release"
           emptyLabel="No documents waiting for verification."
           loading={queueLoading && pendingVerification.length === 0}
           className="border-t border-border lg:border-l lg:border-t-0"
@@ -259,9 +451,7 @@ export function VerificationDashboard() {
                 type="button"
                 onClick={() => setSelectedId(item.id)}
                 className={`flex w-full items-center gap-3 border-b border-border/60 px-4 py-3 text-left last:border-b-0 transition ${
-                  active
-                    ? "bg-accent/10"
-                    : "hover:bg-surface-elevated"
+                  active ? "bg-accent/10" : "hover:bg-surface-elevated"
                 }`}
               >
                 <div className="min-w-0 flex-1">
@@ -293,27 +483,49 @@ export function VerificationDashboard() {
           <QueueClearState />
         </div>
       ) : (
-        <div className="flex min-h-0 flex-1">
+        <div
+          className={`flex min-h-0 flex-1 transition-[outline] duration-300 ${
+            successFlash ? "outline outline-3 outline-success" : "outline-none"
+          }`}
+        >
           <section className="flex w-[60%] min-w-0 flex-col border-r border-border bg-surface">
-            <DocumentViewer
+            <PdfJsViewer
               fileName={selectedItem.file_name}
               documentUrl={documentUrl}
               loading={documentLoading}
               error={null}
+              highlights={highlights}
+              activeFieldKey={activeFieldKey}
             />
           </section>
 
-          <section className="flex w-[40%] min-w-0 flex-col bg-surface-elevated">
+          <section
+            ref={reviewPaneRef}
+            className="flex w-[40%] min-w-0 flex-col bg-surface-elevated"
+          >
             <header className="border-b border-border px-6 py-4">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-accent">
-                Data Validation
-              </p>
-              <h2 className="mt-1 text-lg font-semibold text-foreground">
-                Review Extracted Fields
-              </h2>
-              <p className="mt-1 text-xs text-muted">
-                Job {selectedItem.id.slice(0, 8)} ·{" "}
-                {new Date(selectedItem.created_at).toLocaleString()}
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-accent">
+                    Data Validation
+                  </p>
+                  <h2 className="mt-1 text-lg font-semibold text-foreground">
+                    Review Extracted Fields
+                  </h2>
+                  <p className="mt-1 text-xs text-muted">
+                    Job {selectedItem.id.slice(0, 8)} ·{" "}
+                    {new Date(selectedItem.created_at).toLocaleString()}
+                  </p>
+                </div>
+                {draftSavedAt && (
+                  <span className="shrink-0 rounded-md border border-success/40 bg-success/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-success">
+                    Draft saved
+                  </span>
+                )}
+              </div>
+              <p className="mt-2 text-[11px] text-muted">
+                Tab / 1–9 focus fields · Ctrl+S draft · Ctrl+Enter release ·
+                Ctrl+Backspace reject
               </p>
             </header>
 
@@ -321,24 +533,48 @@ export function VerificationDashboard() {
               {isReviewReady && (
                 <>
                   <div className="space-y-4">
-                    {fieldKeysForPayload(selectedItem.extracted_payload).map(
-                      (key) => (
-                      <label key={key} className="block">
-                        <span className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-muted">
-                          {key.replaceAll("_", " ")}
-                        </span>
-                        <input
-                          type="text"
-                          value={fields[key] ?? ""}
-                          onChange={(event) =>
-                            handleFieldChange(key, event.target.value)
-                          }
-                          className="w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm text-foreground outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/20"
-                          placeholder={`Enter ${key.replaceAll("_", " ").toLowerCase()}…`}
-                        />
-                      </label>
-                    ),
-                    )}
+                    {visibleFieldKeys.map((key, index) => {
+                      const confidence = getFieldConfidence(
+                        selectedItem.extracted_payload,
+                        key,
+                      );
+                      return (
+                        <label key={key} className="block">
+                          <span className="mb-1.5 flex items-center justify-between gap-2 text-xs font-medium uppercase tracking-wide text-muted">
+                            <span className="flex items-center gap-2">
+                              {index < 9 && (
+                                <kbd className="rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[10px] text-muted">
+                                  {index + 1}
+                                </kbd>
+                              )}
+                              {key.replaceAll("_", " ")}
+                            </span>
+                            <ConfidenceBadge confidence={confidence} />
+                          </span>
+                          <input
+                            ref={(node) => {
+                              if (node) {
+                                fieldRefs.current.set(key, node);
+                              } else {
+                                fieldRefs.current.delete(key);
+                              }
+                            }}
+                            type="text"
+                            value={fields[key] ?? ""}
+                            onChange={(event) =>
+                              handleFieldChange(key, event.target.value)
+                            }
+                            onFocus={() => setActiveFieldKey(key)}
+                            className={`w-full rounded-lg border bg-background px-3 py-2.5 text-sm text-foreground outline-none transition focus:ring-2 focus:ring-accent/20 ${
+                              activeFieldKey === key
+                                ? "border-accent"
+                                : "border-border focus:border-accent"
+                            }`}
+                            placeholder={`Enter ${key.replaceAll("_", " ").toLowerCase()}…`}
+                          />
+                        </label>
+                      );
+                    })}
                   </div>
 
                   {normalizeExtractedPayload(selectedItem.extracted_payload)
@@ -370,11 +606,11 @@ export function VerificationDashboard() {
               <footer className="flex gap-3 border-t border-border px-6 py-4">
                 <button
                   type="button"
-                  onClick={() => void handleReject()}
+                  onClick={() => setRejectOpen(true)}
                   disabled={actionLoading !== null}
                   className="flex-1 rounded-lg border border-danger/40 bg-danger/10 px-4 py-2.5 text-sm font-medium text-danger transition hover:bg-danger/20 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {actionLoading === "reject" ? "Rejecting…" : "Reject"}
+                  Reject
                 </button>
                 <button
                   type="button"
@@ -382,13 +618,145 @@ export function VerificationDashboard() {
                   disabled={actionLoading !== null}
                   className="flex-[1.4] rounded-lg bg-accent px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {actionLoading === "approve" ? "Releasing…" : "Approve & Release"}
+                  {actionLoading === "approve"
+                    ? "Releasing…"
+                    : "Approve & Release"}
                 </button>
               </footer>
             )}
           </section>
         </div>
       )}
+
+      {rejectOpen && (
+        <RejectModal
+          reason={rejectReason}
+          onReasonChange={setRejectReason}
+          loading={actionLoading === "reject"}
+          onCancel={() => setRejectOpen(false)}
+          onConfirm={() => void handleRejectConfirm()}
+        />
+      )}
+    </div>
+  );
+}
+
+function ConfidenceBadge({ confidence }: { confidence: number | null }) {
+  if (confidence == null) {
+    return null;
+  }
+  const pct = Math.round(confidence * 100);
+  const ok = confidence >= CONFIDENCE_OK_THRESHOLD;
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-semibold tabular-nums ${
+        ok
+          ? "bg-success/15 text-success"
+          : "bg-amber-500/15 text-amber-400"
+      }`}
+      title={`Extraction confidence ${pct}%`}
+    >
+      {ok ? (
+        <svg
+          viewBox="0 0 16 16"
+          className="h-3 w-3"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          aria-hidden
+        >
+          <path d="M3.5 8.5 6.5 11.5 12.5 4.5" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      ) : (
+        <svg
+          viewBox="0 0 16 16"
+          className="h-3 w-3"
+          fill="currentColor"
+          aria-hidden
+        >
+          <path d="M8 1.5 14.5 13.5H1.5L8 1.5Z" opacity="0.9" />
+          <path d="M8 6v3.5" stroke="#0a0b0f" strokeWidth="1.5" strokeLinecap="round" fill="none" />
+          <circle cx="8" cy="11.2" r="0.7" fill="#0a0b0f" />
+        </svg>
+      )}
+      {pct}%
+    </span>
+  );
+}
+
+function RejectModal({
+  reason,
+  onReasonChange,
+  loading,
+  onCancel,
+  onConfirm,
+}: {
+  reason: RejectReasonValue;
+  onReasonChange: (value: RejectReasonValue) => void;
+  loading: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="reject-modal-title"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onCancel();
+        }
+      }}
+    >
+      <div className="w-full max-w-md rounded-xl border border-border bg-surface-elevated p-5 shadow-2xl">
+        <h3
+          id="reject-modal-title"
+          className="text-base font-semibold text-foreground"
+        >
+          Reject document
+        </h3>
+        <p className="mt-1 text-xs text-muted">
+          Select a reason. This is recorded on the audit trail.
+        </p>
+        <label className="mt-4 block">
+          <span className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-muted">
+            Reason
+          </span>
+          <select
+            autoFocus
+            value={reason}
+            onChange={(event) =>
+              onReasonChange(event.target.value as RejectReasonValue)
+            }
+            className="w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:border-accent focus:ring-2 focus:ring-accent/20"
+          >
+            {REJECT_REASONS.map((item) => (
+              <option key={item.value} value={item.value}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="mt-5 flex gap-3">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={loading}
+            className="flex-1 rounded-lg border border-border px-4 py-2.5 text-sm font-medium text-muted transition hover:bg-surface disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={loading}
+            className="flex-1 rounded-lg border border-danger/40 bg-danger/10 px-4 py-2.5 text-sm font-semibold text-danger transition hover:bg-danger/20 disabled:opacity-50"
+          >
+            {loading ? "Rejecting…" : "Confirm Reject"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
