@@ -13,6 +13,7 @@
     "tauri:build": "tauri build"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
     "next": "16.2.10",
     "pdfjs-dist": "^6.1.200",
     "react": "^19.2.0",

@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # docuvision/config/settings.py → repository root
@@ -96,6 +96,20 @@ class Settings(BaseSettings):
         description=(
             "Comma-separated CORS origins for the FastAPI SPA host. "
             "Env: DOCUVISION_API_CORS_ORIGINS."
+        ),
+    )
+    local_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "LOCAL_API_KEY",
+            "DOCUVISION_LOCAL_API_KEY",
+            "local_api_key",
+        ),
+        description=(
+            "Static local API handshake key for the desktop shell. "
+            "Env: LOCAL_API_KEY or DOCUVISION_LOCAL_API_KEY. "
+            "When unset, run_api mints a single-session token into the "
+            "per-user token.lock file."
         ),
     )
 

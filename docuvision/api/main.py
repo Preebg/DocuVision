@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from docuvision.adapters.postgres_repository import PostgresPipelineRepository
+from docuvision.api.auth import install_api_auth
 from docuvision.api.routes import batches, documents, ingestion, queue
 from docuvision.api.schemas import HealthResponse
 from docuvision.composition import build_backends, build_release_engine, build_release_exporter
@@ -64,6 +65,9 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    # Inner auth gate for all `/api/...` routes (HITL overlays included).
+    # CORS is added after so it stays outermost and can short-circuit OPTIONS.
+    install_api_auth(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins_list(),

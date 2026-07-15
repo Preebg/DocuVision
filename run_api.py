@@ -7,6 +7,11 @@ Usage::
 Binds to ``127.0.0.1:8000`` by default (override with ``DOCUVISION_API_HOST`` /
 ``DOCUVISION_API_PORT``). Docker compose sets host to ``0.0.0.0``.
 
+Local handshake: every ``/api/...`` route requires ``X-API-Key`` (or
+``Authorization: Bearer``). When ``LOCAL_API_KEY`` is unset, a high-entropy
+session token is minted and written to the per-user ``token.lock`` file for the
+Tauri shell to read.
+
 Composes ``docuvision.api`` routers (queue, documents/PDF stream, batch ingest,
 ingestion status) with HITL queue/detail/verify projections over the local
 SQLite database under ``DOCUVISION_DATA_ROOT`` (default: ``<repo>/data``).
@@ -485,6 +490,7 @@ app = create_hitl_app()
 
 
 def main() -> int:
+    from docuvision.api.auth import get_active_api_key, token_lock_path
     from docuvision.config.settings import get_settings
 
     settings = get_settings()
@@ -492,12 +498,16 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Ensure the session/static key + lockfile exist before accepting traffic.
+    api_key = get_active_api_key()
     logging.getLogger(__name__).info(
-        "api.bind host=%s port=%s data_root=%s sqlite=%s",
+        "api.bind host=%s port=%s data_root=%s sqlite=%s auth_lockfile=%s key_prefix=%s…",
         settings.api_host,
         settings.api_port,
         settings.data_root,
         settings.resolved_sqlite_path(),
+        token_lock_path(),
+        api_key[:4],
     )
     uvicorn.run(
         app,

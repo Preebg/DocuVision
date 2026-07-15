@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-read-local-api-token"
+description = "Allow the SPA to read the FastAPI session token.lock hand-off."
+commands.allow = ["read_local_api_token"]

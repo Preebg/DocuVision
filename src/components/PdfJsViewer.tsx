@@ -32,6 +32,11 @@ interface PdfJsViewerProps {
   highlights?: PdfFieldHighlight[];
   /** Field key currently focused in the form sidebar. */
   activeFieldKey?: string | null;
+  /**
+   * Optional HTTP headers when ``documentUrl`` points at the FastAPI file
+   * stream (e.g. ``X-API-Key``). Ignored for ``blob:`` / ``data:`` URLs.
+   */
+  httpHeaders?: Record<string, string> | null;
 }
 
 type PageMetrics = {
@@ -129,6 +134,7 @@ export function PdfJsViewer({
   error = null,
   highlights = [],
   activeFieldKey = null,
+  httpHeaders = null,
 }: PdfJsViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const canvasRefs = useRef<Map<number, HTMLCanvasElement>>(new Map());
@@ -205,7 +211,14 @@ export function PdfJsViewer({
       setPageMetrics([]);
       try {
         const pdfjs = await ensurePdfjs();
-        loadingTask = pdfjs.getDocument({ url: documentUrl });
+        const needsAuthHeaders =
+          Boolean(httpHeaders) &&
+          (documentUrl.startsWith("http://") || documentUrl.startsWith("https://"));
+        loadingTask = pdfjs.getDocument(
+          needsAuthHeaders
+            ? { url: documentUrl, httpHeaders: httpHeaders ?? undefined }
+            : { url: documentUrl },
+        );
         const doc = await loadingTask.promise;
         if (cancelled) {
           void doc.cleanup();
@@ -230,7 +243,7 @@ export function PdfJsViewer({
       void loadingTask?.destroy();
       clearPdf();
     };
-  }, [documentUrl, isPdf]);
+  }, [documentUrl, isPdf, httpHeaders]);
 
   // Recompute fit scale when the first page / container width changes.
   useEffect(() => {

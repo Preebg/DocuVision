@@ -10,7 +10,7 @@ import {
 import { PdfJsViewer, type PdfFieldHighlight } from "@/components/PdfJsViewer";
 import { useOperatorHotkeys } from "@/hooks/useOperatorHotkeys";
 import {
-  documentFileUrl,
+  fetchDocumentObjectUrl,
   fetchHitlDocument,
   verifyHitlDocument,
   type HitlDocumentDetail,
@@ -209,7 +209,47 @@ export function VerificationDashboard({
     onEscape: onBackToQueue,
   });
 
-  const documentUrl = document ? documentFileUrl(document.id) : null;
+  const [documentUrl, setDocumentUrl] = useState<string | null>(null);
+
+  // Authenticated PDF/image bytes → blob URL (X-API-Key; no bare loopback URL).
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl: string | null = null;
+
+    if (!document?.id) {
+      queueMicrotask(() => {
+        if (!cancelled) {
+          setDocumentUrl(null);
+        }
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void (async () => {
+      try {
+        objectUrl = await fetchDocumentObjectUrl(document.id);
+        if (!cancelled) {
+          setDocumentUrl(objectUrl);
+        } else {
+          URL.revokeObjectURL(objectUrl);
+        }
+      } catch {
+        if (!cancelled) {
+          setDocumentUrl(null);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [document?.id]);
+
   const fileName = document?.filename ?? null;
 
   const batchId = document?.batch_id ?? null;

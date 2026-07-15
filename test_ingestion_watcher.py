@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 from fastapi.testclient import TestClient
 
+from conftest import LOCAL_API_HEADERS
 from docuvision.adapters.ingestion.config import load_ingestion_sources
 from docuvision.adapters.ingestion.packager import BatchPackager, group_key_for_path
 from docuvision.adapters.ingestion.status_store import (
@@ -285,7 +286,7 @@ def test_ingestion_status_endpoint(tmp_path: Path) -> None:
     app.state.repository = repository
     app.state.repository_kind = "sqlite"
 
-    response = client.get("/api/ingestion/status")
+    response = client.get("/api/ingestion/status", headers=LOCAL_API_HEADERS)
     assert response.status_code == 200
     payload = response.json()
     assert payload["running"] is True

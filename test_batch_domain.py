@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from conftest import LOCAL_API_HEADERS
 from docuvision.adapters.local_storage import LocalStorageAdapter
 from docuvision.adapters.sqlite_repository import SqlitePipelineRepository
 from docuvision.api.main import create_app
@@ -142,6 +143,7 @@ def test_batch_ingest_and_pending_endpoints(tmp_path: Path) -> None:
                 ("files", ("app_cover.pdf", b"%PDF-1.4 cover", "application/pdf")),
                 ("files", ("app_form.pdf", b"%PDF-1.4 form", "application/pdf")),
             ],
+            headers=LOCAL_API_HEADERS,
         )
         assert response.status_code == 200, response.text
         body = response.json()
@@ -152,7 +154,7 @@ def test_batch_ingest_and_pending_endpoints(tmp_path: Path) -> None:
         assert body["documents"][0]["sequence_no"] == 1
         assert body["documents"][1]["sequence_no"] == 2
 
-        pending = client.get("/api/batches/pending")
+        pending = client.get("/api/batches/pending", headers=LOCAL_API_HEADERS)
         assert pending.status_code == 200
         batches = pending.json()["batches"]
         assert len(batches) == 1
@@ -169,6 +171,7 @@ def test_batch_ingest_rejects_bad_priority(tmp_path: Path) -> None:
             "/api/batches/ingest",
             data={"name": "bad", "priority": "9"},
             files=[("files", ("x.pdf", b"%PDF-1.4", "application/pdf"))],
+            headers=LOCAL_API_HEADERS,
         )
         assert response.status_code == 400
     finally:

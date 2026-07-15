@@ -14,13 +14,108 @@ export function apiUrl(path: string): string {
   return `${getApiBaseUrl()}${normalized}`;
 }
 
+const API_KEY_HEADER = "X-API-Key";
+
+let cachedApiKey: string | null = null;
+let apiKeyPromise: Promise<string> | null = null;
+
+function isTauriRuntime(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    ("__TAURI_INTERNALS__" in window || "__TAURI__" in window)
+  );
+}
+
+/**
+ * Resolve the local handshake token shared with the FastAPI process.
+ *
+ * Priority: in-memory cache → ``NEXT_PUBLIC_LOCAL_API_KEY`` (dev/static) →
+ * Tauri ``read_local_api_token`` (reads the per-user ``token.lock`` file).
+ */
+export async function getLocalApiKey(): Promise<string> {
+  if (cachedApiKey) {
+    return cachedApiKey;
+  }
+  if (apiKeyPromise) {
+    return apiKeyPromise;
+  }
+
+  apiKeyPromise = (async () => {
+    const fromEnv = process.env.NEXT_PUBLIC_LOCAL_API_KEY?.trim();
+    if (fromEnv) {
+      cachedApiKey = fromEnv;
+      return fromEnv;
+    }
+
+    if (isTauriRuntime()) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const token = String(await invoke<string>("read_local_api_token")).trim();
+        if (token) {
+          cachedApiKey = token;
+          return token;
+        }
+      } catch (err) {
+        throw new Error(
+          `Failed to read local API token.lock via Tauri: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+
+    throw new Error(
+      "Local API key unavailable. Set NEXT_PUBLIC_LOCAL_API_KEY to match " +
+        "LOCAL_API_KEY, or launch the Tauri shell so it can read token.lock.",
+    );
+  })();
+
+  try {
+    return await apiKeyPromise;
+  } finally {
+    apiKeyPromise = null;
+  }
+}
+
+/** Auth headers for every request to the local FastAPI loopback API. */
+export async function apiAuthHeaders(
+  extra?: HeadersInit,
+): Promise<Record<string, string>> {
+  const token = await getLocalApiKey();
+  const headers: Record<string, string> = {
+    [API_KEY_HEADER]: token,
+  };
+  if (extra) {
+    const merged = new Headers(extra);
+    merged.forEach((value, key) => {
+      headers[key] = value;
+    });
+  }
+  return headers;
+}
+
+/**
+ * Authenticated fetch against the local API (injects ``X-API-Key``).
+ * Does not force ``Content-Type`` so ``FormData`` uploads keep their boundary.
+ */
+export async function apiFetch(
+  path: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const auth = await apiAuthHeaders(init.headers);
+  return fetch(apiUrl(path), {
+    ...init,
+    headers: auth,
+  });
+}
+
 export type QueuePayload = {
   active_ingestion: import("@/lib/types").DocumentPipelineRow[];
   pending_verification: import("@/lib/types").DocumentPipelineRow[];
 };
 
 export async function fetchQueue(signal?: AbortSignal): Promise<QueuePayload> {
-  const response = await fetch(apiUrl("/api/queue"), {
+  const response = await apiFetch("/api/queue", {
     method: "GET",
     cache: "no-store",
     signal,
@@ -38,7 +133,7 @@ export async function ingestDocument(file: File): Promise<{
 }> {
   const form = new FormData();
   form.append("file", file);
-  const response = await fetch(apiUrl("/api/documents/ingest"), {
+  const response = await apiFetch("/api/documents/ingest", {
     method: "POST",
     body: form,
   });
@@ -79,7 +174,7 @@ export async function patchDocument(
     actor: operator,
   };
 
-  const response = await fetch(apiUrl(`/api/documents/${encodeURIComponent(id)}`), {
+  const response = await apiFetch(`/api/documents/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
@@ -94,8 +189,40 @@ export async function patchDocument(
   return (await response.json()) as import("@/lib/types").DocumentPipelineRow;
 }
 
-export function documentFileUrl(id: string): string {
-  return apiUrl(`/api/documents/${encodeURIComponent(id)}/file`);
+/**
+ * Authenticated streaming URL for PDF/image bytes.
+ * Appends ``api_key`` so ``<img>`` / naive URL loads still pass the gate.
+ */
+export async function documentFileUrl(id: string): Promise<string> {
+  const token = await getLocalApiKey();
+  const url = new URL(apiUrl(`/api/documents/${encodeURIComponent(id)}/file`));
+  url.searchParams.set("api_key", token);
+  return url.toString();
+}
+
+/**
+ * Fetch document bytes with ``X-API-Key`` and return a ``blob:`` object URL.
+ * Preferred for PDF.js / image preview so the key is not required in the URL.
+ */
+export async function fetchDocumentObjectUrl(
+  id: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const response = await apiFetch(
+    `/api/documents/${encodeURIComponent(id)}/file`,
+    { method: "GET", cache: "no-store", signal },
+  );
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || `Document file failed (${response.status})`);
+  }
+  const blob = await response.blob();
+  return URL.createObjectURL(blob);
+}
+
+/** Auth headers for PDF.js ``getDocument({ httpHeaders })``. */
+export async function documentFileHttpHeaders(): Promise<Record<string, string>> {
+  return apiAuthHeaders();
 }
 
 /* ---------------------------------------------------------------------------
@@ -160,7 +287,7 @@ export async function fetchHitlDocuments(
   signal?: AbortSignal,
 ): Promise<HitlDocumentListItem[]> {
   const params = new URLSearchParams({ status });
-  const response = await fetch(apiUrl(`/api/documents?${params}`), {
+  const response = await apiFetch(`/api/documents?${params}`, {
     method: "GET",
     cache: "no-store",
     signal,
@@ -174,7 +301,7 @@ export async function fetchHitlDocuments(
 export async function fetchPendingBatches(
   signal?: AbortSignal,
 ): Promise<HitlPendingBatch[]> {
-  const response = await fetch(apiUrl("/api/batches/pending"), {
+  const response = await apiFetch("/api/batches/pending", {
     method: "GET",
     cache: "no-store",
     signal,
@@ -195,8 +322,8 @@ export async function fetchHitlDocument(
   id: string,
   signal?: AbortSignal,
 ): Promise<HitlDocumentDetail> {
-  const response = await fetch(
-    apiUrl(`/api/documents/${encodeURIComponent(id)}`),
+  const response = await apiFetch(
+    `/api/documents/${encodeURIComponent(id)}`,
     {
       method: "GET",
       cache: "no-store",
@@ -214,8 +341,8 @@ export async function verifyHitlDocument(
   id: string,
   correctedData: Record<string, unknown>,
 ): Promise<HitlVerifyResponse> {
-  const response = await fetch(
-    apiUrl(`/api/documents/${encodeURIComponent(id)}/verify`),
+  const response = await apiFetch(
+    `/api/documents/${encodeURIComponent(id)}/verify`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -233,7 +360,7 @@ export async function fetchHealth(signal?: AbortSignal): Promise<{
   status: string;
   repository: string;
 }> {
-  const response = await fetch(apiUrl("/api/health"), {
+  const response = await apiFetch("/api/health", {
     method: "GET",
     cache: "no-store",
     signal,

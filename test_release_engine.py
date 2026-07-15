@@ -10,6 +10,7 @@ import fitz
 import pytest
 from fastapi.testclient import TestClient
 
+from conftest import LOCAL_API_HEADERS
 from docuvision.adapters.local_storage import LocalStorageAdapter
 from docuvision.adapters.release import FSDropExporter
 from docuvision.adapters.sqlite_repository import SqlitePipelineRepository
@@ -230,7 +231,7 @@ def test_approve_and_release_api_hook(tmp_path: Path) -> None:
                 "verified_payload": {"fields": {"x": "ok"}},
                 "verified_by": "clerk.ada",
             },
-            headers={"X-Operator-Identity": "clerk.ada"},
+            headers={**LOCAL_API_HEADERS, "X-Operator-Identity": "clerk.ada"},
         )
         assert first.status_code == 200, first.text
         assert repository.get_batch(batch.id).status == BatchStatus.READY_FOR_HITL
@@ -242,7 +243,7 @@ def test_approve_and_release_api_hook(tmp_path: Path) -> None:
                 "verified_payload": {"fields": {"x": "ok"}},
                 "verified_by": "clerk.ada",
             },
-            headers={"X-Operator-Identity": "clerk.ada"},
+            headers={**LOCAL_API_HEADERS, "X-Operator-Identity": "clerk.ada"},
         )
         assert second.status_code == 200, second.text
         assert repository.get_batch(batch.id).status == BatchStatus.RELEASED
