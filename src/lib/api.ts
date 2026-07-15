@@ -6,7 +6,7 @@ export function getApiBaseUrl(): string {
   if (raw) {
     return raw.replace(/\/$/, "");
   }
-  return "http://localhost:8000";
+  return "http://127.0.0.1:8000";
 }
 
 export function apiUrl(path: string): string {
@@ -96,6 +96,92 @@ export async function patchDocument(
 
 export function documentFileUrl(id: string): string {
   return apiUrl(`/api/documents/${encodeURIComponent(id)}/file`);
+}
+
+/* ---------------------------------------------------------------------------
+ * HITL queue / detail / verify (run_api.py projections)
+ * metadata.local_path → file_path
+ * metadata.extracted_payload → extracted_json
+ * --------------------------------------------------------------------------- */
+
+export type HitlDocumentListItem = {
+  id: string;
+  filename: string;
+  file_path: string | null;
+  status: string;
+  created_at: string;
+};
+
+export type HitlDocumentDetail = {
+  id: string;
+  filename: string;
+  status: string;
+  retry_count: number;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  file_path: string | null;
+  /** Projected from metadata.extracted_payload (object, not double-encoded). */
+  extracted_json: unknown;
+};
+
+export type HitlVerifyResponse = {
+  status: string;
+  id: string;
+  document_status: string;
+};
+
+export async function fetchHitlDocuments(
+  status: string = "VERIFYING",
+  signal?: AbortSignal,
+): Promise<HitlDocumentListItem[]> {
+  const params = new URLSearchParams({ status });
+  const response = await fetch(apiUrl(`/api/documents?${params}`), {
+    method: "GET",
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`Documents list failed (${response.status})`);
+  }
+  return (await response.json()) as HitlDocumentListItem[];
+}
+
+export async function fetchHitlDocument(
+  id: string,
+  signal?: AbortSignal,
+): Promise<HitlDocumentDetail> {
+  const response = await fetch(
+    apiUrl(`/api/documents/${encodeURIComponent(id)}`),
+    {
+      method: "GET",
+      cache: "no-store",
+      signal,
+    },
+  );
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || `Document detail failed (${response.status})`);
+  }
+  return (await response.json()) as HitlDocumentDetail;
+}
+
+export async function verifyHitlDocument(
+  id: string,
+  correctedData: Record<string, unknown>,
+): Promise<HitlVerifyResponse> {
+  const response = await fetch(
+    apiUrl(`/api/documents/${encodeURIComponent(id)}/verify`),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ corrected_data: correctedData }),
+    },
+  );
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || `Verify failed (${response.status})`);
+  }
+  return (await response.json()) as HitlVerifyResponse;
 }
 
 export async function fetchHealth(signal?: AbortSignal): Promise<{

@@ -47,7 +47,7 @@ export function Sidebar() {
           className="flex items-center gap-2 rounded-lg bg-surface-elevated px-3 py-2.5 text-sm font-medium text-foreground ring-1 ring-border"
         >
           <span className="text-accent">◆</span>
-          Verification Queue
+          Batch Workbench
         </a>
         <p className="mt-4 px-3 text-[11px] uppercase tracking-wider text-muted">
           Station
