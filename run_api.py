@@ -1,8 +1,15 @@
-"""DocuVision local FastAPI service — HITL queue and document detail endpoints.
+"""DocuVision sole FastAPI entrypoint — HITL, batch queue, PDF streaming, ingestion.
 
 Usage::
 
     python run_api.py
+
+Binds to ``127.0.0.1:8000`` by default (override with ``DOCUVISION_API_HOST`` /
+``DOCUVISION_API_PORT``). Docker compose sets host to ``0.0.0.0``.
+
+Composes ``docuvision.api`` routers (queue, documents/PDF stream, batch ingest,
+ingestion status) with HITL queue/detail/verify projections over the local
+SQLite database under ``DOCUVISION_DATA_ROOT`` (default: ``<repo>/data``).
 
 The live SQLite schema (see ``migrations/001_documents_pipeline_events.sql``)
 stores operational fields in ``documents.metadata`` JSON:
@@ -32,17 +39,9 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
-
-DB_PATH = Path(r"C:\Projects\DocuVision\data\docuvision.db")
-
-# Friendly HITL names → values in contracts/pipeline-status.json
 _STATUS_TO_DB: dict[str, str] = {
     "VERIFYING": "PENDING_VERIFICATION",
     "APPROVED": "VERIFIED",
@@ -53,9 +52,16 @@ _META_PAYLOAD = "extracted_payload"
 _META_VERIFIED = "verified_payload"
 
 
+def _db_path() -> Path:
+    from docuvision.config.settings import get_settings
+
+    settings = get_settings()
+    return settings.resolved_sqlite_path()
+
+
 def get_connection() -> sqlite3.Connection:
     """Open a SQLite connection with Row factory (dict-like rows)."""
-    connection = sqlite3.connect(str(DB_PATH), timeout=30)
+    connection = sqlite3.connect(str(_db_path()), timeout=30)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     # DELETE journaling avoids lingering *-wal locks on Windows.
@@ -295,15 +301,24 @@ def _list_pending_batches(connection: sqlite3.Connection) -> list[dict[str, Any]
 
 
 def _strip_route(app: FastAPI, path: str, methods: set[str]) -> None:
-    """Remove a previously registered route so HITL handlers can replace it."""
-    kept = []
-    for route in app.router.routes:
+    """Remove a previously registered route so HITL handlers can replace it.
+
+    Walks both top-level ``app.router.routes`` and nested
+    ``_IncludedRouter.original_router`` tables (FastAPI ≥0.115).
+    """
+    def _keep(route: object) -> bool:
         route_path = getattr(route, "path", None)
         route_methods = set(getattr(route, "methods", None) or set())
         if route_path == path and route_methods.intersection(methods):
+            return False
+        return True
+
+    app.router.routes = [route for route in app.router.routes if _keep(route)]
+    for route in app.router.routes:
+        original = getattr(route, "original_router", None)
+        if original is None or not hasattr(original, "routes"):
             continue
-        kept.append(route)
-    app.router.routes = kept
+        original.routes = [sub for sub in original.routes if _keep(sub)]
 
 
 # ---------------------------------------------------------------------------
@@ -325,20 +340,17 @@ class VerifyResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# FastAPI application
+# FastAPI application — sole production entrypoint
 # ---------------------------------------------------------------------------
 
 
 def create_hitl_app() -> FastAPI:
-    """Build the full DocuVision API and attach HITL queue/detail routes."""
+    """Build the unified DocuVision API (core routers + HITL projections)."""
     from docuvision.api.main import create_app
     from docuvision.config.settings import get_settings
 
     settings = get_settings()
     settings.ensure_directories()
-    # Keep sqlite path aligned with this service's DB helper.
-    if settings.database_url is None:
-        settings.sqlite_path = DB_PATH
 
     app = create_app()
 
@@ -473,14 +485,24 @@ app = create_hitl_app()
 
 
 def main() -> int:
+    from docuvision.config.settings import get_settings
+
+    settings = get_settings()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    logging.getLogger(__name__).info(
+        "api.bind host=%s port=%s data_root=%s sqlite=%s",
+        settings.api_host,
+        settings.api_port,
+        settings.data_root,
+        settings.resolved_sqlite_path(),
+    )
     uvicorn.run(
         app,
-        host="127.0.0.1",
-        port=8000,
+        host=settings.api_host,
+        port=settings.api_port,
         reload=False,
     )
     return 0

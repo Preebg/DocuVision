@@ -8,14 +8,21 @@ from pathlib import Path
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# docuvision/config/settings.py → repository root
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_DATA_ROOT = _REPO_ROOT / "data"
+
 
 class Settings(BaseSettings):
     """On-prem configuration — no cloud credentials.
 
     Environment variables use the ``DOCUVISION_`` prefix, e.g.:
 
-        DOCUVISION_DATA_ROOT=/data
+        DOCUVISION_DATA_ROOT=C:\\Projects\\DocuVision\\data
         DOCUVISION_OLLAMA_BASE_URL=http://192.168.87.219:11434
+
+    Docker compose overrides ``data_root`` to ``/data``. Local Windows
+    defaults to ``<repo>/data`` so SQLite and release paths stay air-gapped.
     """
 
     model_config = SettingsConfigDict(
@@ -27,8 +34,21 @@ class Settings(BaseSettings):
 
     # -- local directory layout -------------------------------------------
     data_root: Path = Field(
-        default=Path("/data"),
+        default=_DEFAULT_DATA_ROOT,
         description="Root for on-prem document directories.",
+    )
+    api_host: str = Field(
+        default="127.0.0.1",
+        description=(
+            "FastAPI bind address for ``run_api.py``. "
+            "Env: DOCUVISION_API_HOST. Use 0.0.0.0 only inside containers."
+        ),
+    )
+    api_port: int = Field(
+        default=8000,
+        ge=1,
+        le=65535,
+        description="FastAPI bind port. Env: DOCUVISION_API_PORT.",
     )
     incoming_dir: Path | None = Field(
         default=None,

@@ -1,8 +1,9 @@
-"""FastAPI application — HITL queue API sharing worker adapters.
+"""FastAPI application factory — routers shared with ``run_api.py``.
 
-Run::
+Production runtime: ``python run_api.py`` (sole bind on DOCUVISION_API_HOST:PORT).
 
-    uvicorn docuvision.api.main:app --host 0.0.0.0 --port 8000
+Do not start this module directly with uvicorn; use ``run_api.py`` so HITL
+queue/detail/verify projections are registered on the same app instance.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
+    """Core routers only — HITL overlays are attached by ``run_api.create_hitl_app``."""
     settings = get_settings()
     app = FastAPI(
         title="DocuVision Local API",
@@ -82,6 +84,3 @@ def create_app() -> FastAPI:
         )
 
     return app
-
-
-app = create_app()

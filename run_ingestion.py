@@ -1,15 +1,19 @@
-"""Pillar 1 — autonomous local / network-share ingestion daemon.
+"""Pillar 1 — sole active local / network-share ingestion daemon.
 
 Usage (on-prem)::
 
-    set DOCUVISION_DATA_ROOT=C:\\data\\docuvision
+    set DOCUVISION_DATA_ROOT=C:\\Projects\\DocuVision\\data
     set DOCUVISION_INGESTION_SOURCES_PATH=C:\\Projects\\DocuVision\\config\\ingestion_sources.yaml
     python run_ingestion.py
 
 Watches sources declared in ``config/ingestion_sources.yaml``, packages stable
 files into Batches (Migration 002), and writes a heartbeat for
-``GET /api/ingestion/status``. The pipeline worker (``run_worker.py``) continues
-to claim queued jobs from the shared ingress directory.
+``GET /api/ingestion/status``. Persistence is local SQLite at
+``{data_root}/docuvision.db`` (no cloud sync).
+
+The retired Supabase cloud watcher lives under ``quarantine/watcher.py`` and
+must not be started. The pipeline worker (``run_worker.py``) claims queued
+jobs from the shared ingress directory.
 """
 
 from __future__ import annotations

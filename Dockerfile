@@ -27,6 +27,7 @@ COPY config ./config
 COPY run_worker.py .
 COPY run_api.py .
 COPY run_ingestion.py .
+COPY release_manager.py .
 
 ENV PYTHONUNBUFFERED=1 \
     DOCUVISION_DATA_ROOT=/data

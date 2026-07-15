@@ -3,8 +3,8 @@
 Invoked after HITL approval transitions a document to ``VERIFIED``. This
 module performs the terminal ``VERIFIED`` → ``RELEASED`` handoff:
 
-1. Export the clerk-corrected JSON payload to ``data/exports``
-2. Archive the original PDF from ``metadata.local_path`` to ``data/archive``
+1. Export the clerk-corrected JSON payload to ``{data_root}/exports``
+2. Archive the original PDF from ``metadata.local_path`` to ``{data_root}/archive``
 3. Persist status ``RELEASED`` in SQLite
 """
 
@@ -19,10 +19,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(r"C:\Projects\DocuVision\data\docuvision.db")
-EXPORT_DIR = Path(r"C:\Projects\DocuVision\data\exports")
-ARCHIVE_DIR = Path(r"C:\Projects\DocuVision\data\archive")
-
 STATUS_VERIFIED = "VERIFIED"
 STATUS_RELEASED = "RELEASED"
 
@@ -31,15 +27,34 @@ _META_PAYLOAD = "extracted_payload"
 _META_VERIFIED = "verified_payload"
 
 
+def _data_root() -> Path:
+    """Resolve the clean on-prem data root (never hardcoded)."""
+    from docuvision.config.settings import get_settings
+
+    return get_settings().data_root
+
+
+def db_path() -> Path:
+    return _data_root() / "docuvision.db"
+
+
+def export_dir() -> Path:
+    return _data_root() / "exports"
+
+
+def archive_dir() -> Path:
+    return _data_root() / "archive"
+
+
 def ensure_directories() -> None:
     """Create export and archive directories when missing."""
-    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    export_dir().mkdir(parents=True, exist_ok=True)
+    archive_dir().mkdir(parents=True, exist_ok=True)
 
 
 def get_connection() -> sqlite3.Connection:
     """Open a clean SQLite connection with Row factory."""
-    connection = sqlite3.connect(str(DB_PATH), timeout=30)
+    connection = sqlite3.connect(str(db_path()), timeout=30)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     # DELETE journaling avoids lingering *-wal locks on Windows.
@@ -72,7 +87,7 @@ def _safe_filename(name: str) -> str:
 def _export_json(doc_id: str, filename: str, payload: Any) -> Path:
     ensure_directories()
     safe_name = _safe_filename(filename)
-    export_path = EXPORT_DIR / f"{doc_id}_{safe_name}.json"
+    export_path = export_dir() / f"{doc_id}_{safe_name}.json"
     export_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -102,13 +117,13 @@ def _archive_pdf(local_path: str | None, filename: str) -> Path | None:
     # Prefer keeping the original extension when filename has none.
     if not Path(dest_name).suffix and source.suffix:
         dest_name = f"{dest_name}{source.suffix}"
-    destination = ARCHIVE_DIR / dest_name
+    destination = archive_dir() / dest_name
 
     # Avoid clobbering an existing archive entry for a distinct document.
     if destination.exists() and destination.resolve() != source.resolve():
         stem = destination.stem
         suffix = destination.suffix
-        destination = ARCHIVE_DIR / f"{stem}_{source.stat().st_mtime_ns}{suffix}"
+        destination = archive_dir() / f"{stem}_{source.stat().st_mtime_ns}{suffix}"
 
     try:
         shutil.copy2(source, destination)
@@ -198,7 +213,3 @@ def release_document(doc_id: int | str) -> dict[str, Any]:
         return result
     finally:
         connection.close()
-
-
-# Ensure target dirs exist on import (safe no-op if already present).
-ensure_directories()

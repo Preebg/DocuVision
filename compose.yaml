@@ -63,6 +63,8 @@ services:
     environment:
       DOCUVISION_DATA_ROOT: /data
       DOCUVISION_DATABASE_URL: ${DOCUVISION_DATABASE_URL:-}
+      DOCUVISION_API_HOST: "0.0.0.0"
+      DOCUVISION_API_PORT: "8000"
       DOCUVISION_API_CORS_ORIGINS: ${DOCUVISION_API_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,tauri://localhost}
       DOCUVISION_INGESTION_SOURCES_PATH: /app/config/ingestion_sources.yaml
     restart: unless-stopped
