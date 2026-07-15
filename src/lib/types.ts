@@ -31,19 +31,33 @@ export type PipelineStatusType = keyof typeof PipelineStatus;
 export interface FieldBBox {
   /** 1-based page index. */
   page: number;
-  /** Left edge; ≤1 treated as fraction of page width, otherwise PDF points. */
+  /**
+   * Left edge.
+   * - ≤1 → fraction of page width
+   * - ≤1000 (and not fractional) → 0–1000 normalized scale
+   * - otherwise → absolute CSS/PDF units
+   */
   x: number;
-  /** Top edge; ≤1 treated as fraction of page height, otherwise PDF points. */
+  /** Top edge (same units as ``x``). */
   y: number;
   w: number;
   h: number;
+  /** Explicit coordinate space when known from ``normalized_bbox``. */
+  space?: "fractional" | "normalized_1000" | "absolute";
 }
 
 /** Rich field value emitted by extraction (value + optional confidence/bbox). */
 export interface ExtractedFieldValue {
-  value: string;
-  confidence?: number;
+  value: string | number | boolean;
+  confidence?: number | null;
+  /** Absolute pixel box from Qwen2.5-VL: [x1, y1, x2, y2]. */
+  bbox_2d?: number[] | null;
+  /** Resolution-independent box on a 0–1000 scale: [x1, y1, x2, y2]. */
+  normalized_bbox?: number[] | null;
+  /** Legacy object form used by older overlays. */
   bbox?: FieldBBox | null;
+  /** 1-based page index. */
+  page?: number;
 }
 
 export type ExtractedFieldEntry = string | ExtractedFieldValue;
@@ -246,7 +260,20 @@ export function coerceFieldString(entry: ExtractedFieldEntry | undefined): strin
   if (typeof entry === "string") {
     return entry;
   }
-  return typeof entry.value === "string" ? entry.value : "";
+  if (typeof entry === "number" || typeof entry === "boolean") {
+    return String(entry);
+  }
+  const value = entry.value;
+  if (value == null) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return "";
 }
 
 export function getFieldValue(
@@ -260,7 +287,7 @@ export function getFieldValue(
 /** Confidence in [0, 1] when present on the field object or field_meta. */
 export function getFieldConfidence(
   payload: ExtractedPayload | null | undefined,
-  key: VerificationFieldKey,
+  key: string,
 ): number | null {
   const normalized = normalizeExtractedPayload(payload);
   const entry = normalized.fields?.[key];
@@ -277,12 +304,26 @@ export function getFieldConfidence(
 /** Bounding box for a field when the extraction payload includes geometry. */
 export function getFieldBBox(
   payload: ExtractedPayload | null | undefined,
-  key: VerificationFieldKey,
+  key: string,
 ): FieldBBox | null {
   const normalized = normalizeExtractedPayload(payload);
   const entry = normalized.fields?.[key];
-  if (isFieldObject(entry) && entry.bbox) {
-    return normalizeBBox(entry.bbox);
+  if (isFieldObject(entry)) {
+    const fromNormalized = bboxFromNormalizedArray(
+      entry.normalized_bbox,
+      entry.page,
+    );
+    if (fromNormalized) {
+      return fromNormalized;
+    }
+    const fromXyxy = bboxFromNormalizedArray(entry.bbox_2d, entry.page);
+    if (fromXyxy) {
+      // Without image size, bbox_2d may already be on 0–1000.
+      return fromXyxy;
+    }
+    if (entry.bbox) {
+      return normalizeBBox(entry.bbox);
+    }
   }
   const meta = normalized.field_meta?.[key];
   if (meta?.bbox) {
@@ -293,9 +334,9 @@ export function getFieldBBox(
 
 export function getFieldBBoxes(
   payload: ExtractedPayload | null | undefined,
-): Partial<Record<VerificationFieldKey, FieldBBox>> {
+): Partial<Record<string, FieldBBox>> {
   const keys = fieldKeysForPayload(payload);
-  const out: Partial<Record<VerificationFieldKey, FieldBBox>> = {};
+  const out: Partial<Record<string, FieldBBox>> = {};
   for (const key of keys) {
     const bbox = getFieldBBox(payload, key);
     if (bbox) {
@@ -314,6 +355,34 @@ function clampConfidence(value: number): number {
   return Math.max(0, Math.min(1, scaled));
 }
 
+/** Convert [x1,y1,x2,y2] on a 0–1000 scale into overlay metrics. */
+function bboxFromNormalizedArray(
+  raw: number[] | null | undefined,
+  page?: number,
+): FieldBBox | null {
+  if (!Array.isArray(raw) || raw.length < 4) {
+    return null;
+  }
+  const x1 = Number(raw[0]);
+  const y1 = Number(raw[1]);
+  const x2 = Number(raw[2]);
+  const y2 = Number(raw[3]);
+  if (![x1, y1, x2, y2].every((n) => Number.isFinite(n))) {
+    return null;
+  }
+  if (x1 === 0 && y1 === 0 && x2 === 0 && y2 === 0) {
+    return null;
+  }
+  return {
+    page: Math.max(1, Math.floor(Number(page) || 1)),
+    x: x1,
+    y: y1,
+    w: x2 - x1,
+    h: y2 - y1,
+    space: "normalized_1000",
+  };
+}
+
 function normalizeBBox(raw: FieldBBox): FieldBBox | null {
   const page = Number(raw.page);
   const x = Number(raw.x);
@@ -323,7 +392,14 @@ function normalizeBBox(raw: FieldBBox): FieldBBox | null {
   if (![page, x, y, w, h].every((n) => Number.isFinite(n))) {
     return null;
   }
-  return { page: Math.max(1, Math.floor(page)), x, y, w, h };
+  return {
+    page: Math.max(1, Math.floor(page)),
+    x,
+    y,
+    w,
+    h,
+    space: raw.space,
+  };
 }
 
 export function buildVerifiedPayload(

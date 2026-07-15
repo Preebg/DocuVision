@@ -10,6 +10,11 @@ stores operational fields in ``documents.metadata`` JSON:
 * ``local_path`` → exposed as ``file_path``
 * ``extracted_payload`` → exposed as ``extracted_json``
 
+``extracted_payload`` is a nested JSON object. Vision extraction stores rich
+per-field entries (``value``, ``bbox_2d``, ``normalized_bbox``, ``confidence``)
+inside ``extracted_payload.fields``; HITL verify/read paths must keep that
+structure as a real object (never double-encoded as a string).
+
 HITL API aliases map onto pipeline contract statuses:
 
 * ``VERIFYING`` → ``PENDING_VERIFICATION``
@@ -74,7 +79,17 @@ def _loads_json_object(raw: str | None) -> dict[str, Any]:
 
 
 def _parse_extracted_json(value: Any) -> Any:
-    """Return extracted payload as a dict/list, never a double-encoded string."""
+    """Return extracted payload as a dict/list, never a double-encoded string.
+
+    Preserves nested rich field objects::
+
+        fields.invoice_number = {
+            "value": "...",
+            "bbox_2d": [...],
+            "normalized_bbox": [...],
+            "confidence": 0.98,
+        }
+    """
     if value is None:
         return None
     if isinstance(value, (dict, list)):
@@ -116,6 +131,7 @@ def _list_item_from_row(row: sqlite3.Row) -> dict[str, Any]:
 
 def _detail_from_row(row: sqlite3.Row) -> dict[str, Any]:
     metadata = _loads_json_object(row["metadata"])
+    # Keep nested value/bbox/confidence objects intact for the PDF overlay.
     extracted = _parse_extracted_json(metadata.get(_META_PAYLOAD))
     return {
         "id": row["id"],
@@ -237,6 +253,13 @@ def create_hitl_app() -> FastAPI:
             metadata = _loads_json_object(row["metadata"])
             corrected = body.corrected_data
             # Persist corrected extraction for both pipeline keys used by HITL.
+            # corrected_data is a nested dict — serialize once via metadata JSON
+            # so value / normalized_bbox / confidence survive round-trips.
+            if not isinstance(corrected, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="corrected_data must be a JSON object.",
+                )
             metadata[_META_PAYLOAD] = corrected
             metadata[_META_VERIFIED] = corrected
 

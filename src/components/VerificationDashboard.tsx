@@ -7,7 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { PdfJsViewer } from "@/components/PdfJsViewer";
+import { PdfJsViewer, type PdfFieldHighlight } from "@/components/PdfJsViewer";
 import { useOperatorHotkeys } from "@/hooks/useOperatorHotkeys";
 import {
   documentFileUrl,
@@ -21,6 +21,12 @@ import {
   getEditableFieldValue,
   humanizeFieldKey,
 } from "@/lib/hitl-payload";
+import {
+  getFieldBBox,
+  getFieldConfidence,
+  normalizeExtractedPayload,
+  type ExtractedPayload,
+} from "@/lib/types";
 
 export type VerificationDashboardProps = {
   /** Document id from the BatchWorkbench selection. */
@@ -59,10 +65,34 @@ export function VerificationDashboard({
     return document.metadata?.extracted_payload ?? null;
   }, [document]);
 
+  const extractedPayload = useMemo(
+    () =>
+      normalizeExtractedPayload(
+        (extractedSource as ExtractedPayload | null | undefined) ?? null,
+      ),
+    [extractedSource],
+  );
+
   const fieldKeys = useMemo(
     () => editableFieldKeys(extractedSource),
     [extractedSource],
   );
+
+  const highlights = useMemo((): PdfFieldHighlight[] => {
+    const items: PdfFieldHighlight[] = [];
+    for (const key of fieldKeys) {
+      const bbox = getFieldBBox(extractedPayload, key);
+      if (!bbox) {
+        continue;
+      }
+      items.push({
+        key,
+        bbox,
+        confidence: getFieldConfidence(extractedPayload, key),
+      });
+    }
+    return items;
+  }, [extractedPayload, fieldKeys]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -237,13 +267,14 @@ export function VerificationDashboard({
       </header>
 
       <div className="flex min-h-0 flex-1">
-        {/* Left: PDF / document viewer */}
+        {/* Left: PDF / document viewer with field bbox overlays */}
         <section className="flex w-[58%] min-w-0 flex-col border-r border-border bg-surface">
           <PdfJsViewer
             fileName={fileName}
             documentUrl={documentUrl}
             loading={false}
             error={null}
+            highlights={highlights}
             activeFieldKey={activeFieldKey}
           />
           {document.file_path && (
@@ -266,8 +297,8 @@ export function VerificationDashboard({
               Review Extracted Fields
             </h2>
             <p className="mt-1 text-xs text-muted">
-              Edit any value, then Approve &amp; Release. Shortcuts work from
-              any field.
+              Focus a field to highlight its source location on the PDF. Edit
+              any value, then Approve &amp; Release.
             </p>
           </header>
 
@@ -279,39 +310,55 @@ export function VerificationDashboard({
               </p>
             ) : (
               <div className="space-y-4">
-                {fieldKeys.map((key, index) => (
-                  <label key={key} className="block">
-                    <span className="mb-1.5 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-muted">
-                      {index < 9 && (
-                        <kbd className="rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[10px] text-muted">
-                          {index + 1}
-                        </kbd>
-                      )}
-                      {humanizeFieldKey(key)}
-                    </span>
-                    <input
-                      ref={(node) => {
-                        if (node) {
-                          fieldRefs.current.set(key, node);
-                        } else {
-                          fieldRefs.current.delete(key);
+                {fieldKeys.map((key, index) => {
+                  const confidence = getFieldConfidence(extractedPayload, key);
+                  const hasBox = Boolean(getFieldBBox(extractedPayload, key));
+                  return (
+                    <label key={key} className="block">
+                      <span className="mb-1.5 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-muted">
+                        {index < 9 && (
+                          <kbd className="rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[10px] text-muted">
+                            {index + 1}
+                          </kbd>
+                        )}
+                        {humanizeFieldKey(key)}
+                        {confidence != null && (
+                          <span className="ml-auto rounded bg-background px-1.5 py-0.5 font-mono text-[10px] normal-case tracking-normal text-muted">
+                            {Math.round(confidence * 100)}%
+                          </span>
+                        )}
+                        {hasBox && (
+                          <span
+                            className="h-2 w-2 shrink-0 rounded-sm border border-blue-500 bg-yellow-300/80"
+                            title="Has PDF highlight"
+                            aria-hidden
+                          />
+                        )}
+                      </span>
+                      <input
+                        ref={(node) => {
+                          if (node) {
+                            fieldRefs.current.set(key, node);
+                          } else {
+                            fieldRefs.current.delete(key);
+                          }
+                        }}
+                        type="text"
+                        value={formValues[key] ?? ""}
+                        onChange={(event) =>
+                          handleFieldChange(key, event.target.value)
                         }
-                      }}
-                      type="text"
-                      value={formValues[key] ?? ""}
-                      onChange={(event) =>
-                        handleFieldChange(key, event.target.value)
-                      }
-                      onFocus={() => setActiveFieldKey(key)}
-                      className={`w-full rounded-lg border bg-background px-3 py-2.5 text-sm text-foreground outline-none transition focus:ring-2 focus:ring-accent/20 ${
-                        activeFieldKey === key
-                          ? "border-accent"
-                          : "border-border focus:border-accent"
-                      }`}
-                      placeholder={`Enter ${humanizeFieldKey(key).toLowerCase()}…`}
-                    />
-                  </label>
-                ))}
+                        onFocus={() => setActiveFieldKey(key)}
+                        className={`w-full rounded-lg border bg-background px-3 py-2.5 text-sm text-foreground outline-none transition focus:ring-2 focus:ring-accent/20 ${
+                          activeFieldKey === key
+                            ? "border-accent"
+                            : "border-border focus:border-accent"
+                        }`}
+                        placeholder={`Enter ${humanizeFieldKey(key).toLowerCase()}…`}
+                      />
+                    </label>
+                  );
+                })}
               </div>
             )}
 

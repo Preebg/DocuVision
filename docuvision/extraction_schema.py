@@ -81,11 +81,14 @@ def is_empty_extraction(parsed_json: dict[str, Any]) -> bool:
         ]
         fields = payload.get("fields")
         if isinstance(fields, dict):
-            text_values.extend(
-                str(value).strip()
-                for value in fields.values()
-                if isinstance(value, (str, int, float))
-            )
+            for value in fields.values():
+                if isinstance(value, (str, int, float)):
+                    text_values.append(str(value).strip())
+                elif isinstance(value, dict) and "value" in value:
+                    # Rich field objects: {value, bbox_2d, confidence, ...}
+                    inner = value.get("value")
+                    if isinstance(inner, (str, int, float)):
+                        text_values.append(str(inner).strip())
         return not any(text_values)
 
     return False

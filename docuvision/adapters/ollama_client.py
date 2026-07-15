@@ -126,6 +126,8 @@ class OllamaVisionClient:
         self._primary_model = settings.ollama_primary_model
         self._fallback_model = settings.ollama_fallback_model
         self._warmup = settings.ollama_warmup
+        # (width, height) of the first processed page/image last sent to the VLM.
+        self._last_processed_image_size: tuple[int, int] | None = None
 
     @property
     def base_url(self) -> str:
@@ -138,6 +140,11 @@ class OllamaVisionClient:
     @property
     def fallback_model(self) -> str:
         return self._fallback_model
+
+    @property
+    def last_processed_image_size(self) -> tuple[int, int] | None:
+        """Pixel size of the first image encoded for the latest vision call."""
+        return self._last_processed_image_size
 
     def extract_fields(
         self,
@@ -329,11 +336,16 @@ class OllamaVisionClient:
 
     def encode_images_base64(self, file_path: str) -> list[str]:
         encoded: list[str] = []
-        for image_bytes, size_label in self._prepare_images(file_path):
+        self._last_processed_image_size = None
+        for image_bytes, size_label, width, height in self._prepare_images(file_path):
+            if self._last_processed_image_size is None:
+                self._last_processed_image_size = (width, height)
             logger.info(
-                "ollama.image prepared label=%s bytes=%s",
+                "ollama.image prepared label=%s bytes=%s size=%sx%s",
                 size_label,
                 len(image_bytes),
+                width,
+                height,
             )
             encoded.append(base64.b64encode(image_bytes).decode("utf-8"))
         return encoded
@@ -356,14 +368,15 @@ class OllamaVisionClient:
             f"{layout_text if layout_text else '(no layout text extracted)'}"
         )
 
-    def _prepare_images(self, file_path: str) -> list[tuple[bytes, str]]:
+    def _prepare_images(self, file_path: str) -> list[tuple[bytes, str, int, int]]:
         path = Path(file_path)
         if path.suffix.lower() == ".pdf":
             return self._render_pdf_pages(file_path)
 
         if Image is None:
             with open(file_path, "rb") as handle:
-                return [(handle.read(), "original")]
+                data = handle.read()
+            return [(data, "original", 0, 0)]
 
         with Image.open(file_path) as image:
             image = image.convert("RGB")
@@ -374,15 +387,17 @@ class OllamaVisionClient:
                 scale = max_dim / max(width, height)
                 resized = (max(1, int(width * scale)), max(1, int(height * scale)))
                 image = image.resize(resized, Image.Resampling.LANCZOS)
-                size_label = f"{width}x{height} -> {resized[0]}x{resized[1]}"
+                out_w, out_h = resized
+                size_label = f"{width}x{height} -> {out_w}x{out_h}"
             else:
+                out_w, out_h = width, height
                 size_label = f"{width}x{height}"
 
             buffer = io.BytesIO()
             image.save(buffer, format="JPEG", quality=85, optimize=True)
-            return [(buffer.getvalue(), size_label)]
+            return [(buffer.getvalue(), size_label, out_w, out_h)]
 
-    def _render_pdf_pages(self, pdf_path: str) -> list[tuple[bytes, str]]:
+    def _render_pdf_pages(self, pdf_path: str) -> list[tuple[bytes, str, int, int]]:
         try:
             import fitz
         except ImportError as exc:
@@ -390,7 +405,7 @@ class OllamaVisionClient:
                 "PDF support requires PyMuPDF. Install with: pip install pymupdf"
             ) from exc
 
-        rendered: list[tuple[bytes, str]] = []
+        rendered: list[tuple[bytes, str, int, int]] = []
         with fitz.open(pdf_path) as doc:
             page_count = len(doc)
             pages_to_render = min(page_count, self._pdf_max_pages)
@@ -418,7 +433,9 @@ class OllamaVisionClient:
                     f"pdf page {page_index + 1}/{page_count} "
                     f"({pixmap.width}x{pixmap.height})"
                 )
-                rendered.append((pixmap.tobytes("jpeg"), label))
+                rendered.append(
+                    (pixmap.tobytes("jpeg"), label, pixmap.width, pixmap.height)
+                )
 
         if not rendered:
             raise RuntimeError("PDF did not contain any renderable pages.")

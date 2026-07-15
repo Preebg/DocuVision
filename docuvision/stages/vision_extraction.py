@@ -107,7 +107,19 @@ class VisionExtractionStage:
                 schema=schema,
                 registry=self._registry,
             )
-            normalized = self._registry.normalize_extraction(schema, parsed)
+            image_size = self._client.last_processed_image_size
+            image_width = image_size[0] if image_size else None
+            image_height = image_size[1] if image_size else None
+            # Drop zero-sized placeholders (raw bytes without PIL).
+            if image_width == 0 or image_height == 0:
+                image_width = None
+                image_height = None
+            normalized = self._registry.normalize_extraction(
+                schema,
+                parsed,
+                image_width=image_width,
+                image_height=image_height,
+            )
             validated = validate_extraction_payload(normalized)
         except ModelRecoverableError:
             raise
@@ -124,8 +136,10 @@ class VisionExtractionStage:
             )
 
         logger.info(
-            "vision.complete model=%s class_id=%s",
+            "vision.complete model=%s class_id=%s image_size=%sx%s",
             model,
             schema.class_id,
+            image_width or "?",
+            image_height or "?",
         )
         return validated

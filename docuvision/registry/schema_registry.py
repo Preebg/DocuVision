@@ -31,6 +31,114 @@ _FIELD_TYPE_TO_JSON: dict[str, dict[str, Any]] = {
     "array": {"type": "array", "items": {"type": "string"}},
 }
 
+# Qwen2.5-VL emits absolute pixel boxes; we store a 0–1000 normalized copy.
+NORMALIZED_BBOX_SCALE = 1000.0
+
+
+def _rich_field_json_schema(value_schema: dict[str, Any]) -> dict[str, Any]:
+    """Per-field object: value + native bbox_2d + confidence (Qwen2.5-VL)."""
+    return {
+        "type": "object",
+        "properties": {
+            "value": value_schema,
+            "bbox_2d": {
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 4,
+                "maxItems": 4,
+                "description": (
+                    "Absolute pixel box [x1, y1, x2, y2] in the processed "
+                    "image coordinate space (Qwen2.5-VL native)."
+                ),
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "description": "Model confidence in [0.0, 1.0].",
+            },
+            "page": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-based page index when multiple images are attached.",
+            },
+        },
+        "required": ["value", "bbox_2d", "confidence"],
+        "additionalProperties": False,
+    }
+
+
+def _as_bbox_xyxy(raw: Any) -> list[float] | None:
+    """Accept [x1,y1,x2,y2] lists/tuples; return four floats or None."""
+    if not isinstance(raw, (list, tuple)) or len(raw) < 4:
+        return None
+    try:
+        coords = [float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3])]
+    except (TypeError, ValueError):
+        return None
+    if not all(c == c and abs(c) != float("inf") for c in coords):  # NaN / inf
+        return None
+    return coords
+
+
+def normalize_bbox_to_1000(
+    bbox_2d: list[float],
+    image_width: int | float,
+    image_height: int | float,
+) -> list[float] | None:
+    """Convert absolute pixel [x1,y1,x2,y2] → 0–1000 scale.
+
+    ``x_normalized = (x / width) * 1000``
+    ``y_normalized = (y / height) * 1000``
+    """
+    width = float(image_width)
+    height = float(image_height)
+    if width <= 0 or height <= 0:
+        return None
+    x1, y1, x2, y2 = bbox_2d
+    scale = NORMALIZED_BBOX_SCALE
+    return [
+        round((x1 / width) * scale, 4),
+        round((y1 / height) * scale, 4),
+        round((x2 / width) * scale, 4),
+        round((y2 / height) * scale, 4),
+    ]
+
+
+def _clamp_confidence(raw: Any) -> float | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value != value:  # NaN
+        return None
+    # Accept accidental 0–100 percentages from the model.
+    if value > 1.0:
+        value = value / 100.0
+    return max(0.0, min(1.0, value))
+
+
+def _unpack_field_entry(
+    raw: Any,
+) -> tuple[Any, list[float] | None, list[float] | None, float | None, int]:
+    """Split a model field into (value, bbox_2d, pre_normalized, confidence, page)."""
+    if isinstance(raw, dict) and "value" in raw:
+        value = raw.get("value")
+        bbox_2d = _as_bbox_xyxy(raw.get("bbox_2d")) or _as_bbox_xyxy(raw.get("bbox"))
+        # Prefer an explicit normalized_bbox when the model (or a prior pass)
+        # already stored 0–1000 coords.
+        pre_normalized = _as_bbox_xyxy(raw.get("normalized_bbox"))
+        confidence = _clamp_confidence(raw.get("confidence"))
+        try:
+            page = max(1, int(raw.get("page") or 1))
+        except (TypeError, ValueError):
+            page = 1
+        return value, bbox_2d, pre_normalized, confidence, page
+
+    return raw, None, None, None, 1
+
 
 @dataclass(frozen=True, slots=True)
 class FieldDefinition:
@@ -347,6 +455,17 @@ class SchemaRegistry:
             f"Document class: `{schema.class_id}` ({schema.display_name}).\n"
             "Extract ONLY the fields listed below. Do not invent extra keys.\n"
             "Return valid JSON only that matches the response schema exactly.\n\n"
+            "CRITICAL — every field under \"fields\" MUST be an object with:\n"
+            '  - "value": the extracted text or number as a string/number\n'
+            '  - "bbox_2d": absolute pixel box [x1, y1, x2, y2] in the '
+            "processed image pixel space (Qwen2.5-VL native coordinates)\n"
+            '  - "confidence": float in [0.0, 1.0] estimating extraction '
+            "certainty\n"
+            '  - "page" (optional): 1-based page index when multiple images '
+            "are attached (default 1)\n"
+            "Example field object:\n"
+            '  {"value": "INV-2026-001", "bbox_2d": [120, 240, 310, 280], '
+            '"confidence": 0.98}\n\n'
             f"Fields to extract:\n{field_lines}"
         )
 
@@ -365,20 +484,27 @@ class SchemaRegistry:
         return (
             "Use BOTH the attached image(s) and the bundled layout text.\n"
             f'Put every extracted field under "fields" using keys: {keys}.\n'
+            "Each field value MUST be an object "
+            '{"value": ..., "bbox_2d": [x1,y1,x2,y2], "confidence": 0.0-1.0}.\n'
+            "bbox_2d uses absolute pixel coordinates of the processed page "
+            "image (origin top-left, x rightward, y downward).\n"
             'Also populate "full_text" (exhaustive OCR) and "summary" '
             "(1-2 sentences).\n"
-            "Empty string is allowed only when a field is truly absent.\n\n"
+            "Empty string is allowed for value only when a field is truly "
+            "absent; still return bbox_2d as [0,0,0,0] and confidence 0.0.\n\n"
             "Bundled Docling structural markdown layout:\n"
             f"{layout_text if layout_text else '(no layout text extracted)'}"
         )
 
     def build_extraction_json_schema(self, schema: DocumentSchema) -> dict[str, Any]:
-        """Ollama ``format`` schema — fields match the matched document class."""
+        """Ollama ``format`` schema — rich field objects with bbox + confidence."""
         field_props: dict[str, Any] = {}
         for fdef in schema.fields:
-            prop = dict(_FIELD_TYPE_TO_JSON.get(fdef.type, {"type": "string"}))
-            prop["description"] = fdef.description_prompt
-            field_props[fdef.name] = prop
+            value_schema = dict(
+                _FIELD_TYPE_TO_JSON.get(fdef.type, {"type": "string"})
+            )
+            value_schema["description"] = fdef.description_prompt
+            field_props[fdef.name] = _rich_field_json_schema(value_schema)
 
         required_fields = list(schema.field_names())
         return {
@@ -402,8 +528,26 @@ class SchemaRegistry:
         self,
         schema: DocumentSchema,
         parsed: dict[str, Any],
+        *,
+        image_width: int | float | None = None,
+        image_height: int | float | None = None,
     ) -> dict[str, Any]:
-        """Normalize model JSON into the stable pipeline envelope."""
+        """Normalize model JSON into the stable pipeline envelope.
+
+        Each field becomes::
+
+            {
+              "value": <coerced>,
+              "bbox_2d": [x1, y1, x2, y2] | null,          # absolute pixels
+              "normalized_bbox": [x1n, y1n, x2n, y2n] | null,  # 0–1000
+              "confidence": float | null,
+              "page": int,
+            }
+
+        When ``image_width`` / ``image_height`` match the processed image
+        sent to Qwen2.5-VL, absolute ``bbox_2d`` coords are scaled into
+        ``normalized_bbox`` for resolution-independent PDF overlays.
+        """
         raw_fields = parsed.get("fields")
         if not isinstance(raw_fields, dict):
             # Model may have returned flat schema keys at the top level.
@@ -413,38 +557,107 @@ class SchemaRegistry:
                 if name in parsed
             }
 
+        # Prefer explicit args; fall back to optional metadata on the parse.
+        size_meta = parsed.get("_image_size")
+        if isinstance(size_meta, dict):
+            if image_width is None:
+                image_width = size_meta.get("width")
+            if image_height is None:
+                image_height = size_meta.get("height")
+
         fields: dict[str, Any] = {}
         for fdef in schema.fields:
-            value = raw_fields.get(fdef.name, "")
+            raw_entry = raw_fields.get(fdef.name, "")
+            value, bbox_2d, pre_normalized, confidence, page = _unpack_field_entry(
+                raw_entry
+            )
             if value is None:
                 value = ""
             if fdef.type == "string":
-                fields[fdef.name] = str(value)
-            else:
-                fields[fdef.name] = value
+                value = str(value)
+
+            raw_bbox = bbox_2d
+            normalized: list[float] | None = None
+
+            if (
+                raw_bbox is not None
+                and image_width is not None
+                and image_height is not None
+                and float(image_width) > 0
+                and float(image_height) > 0
+            ):
+                # Qwen2.5-VL native: absolute pixels → 0–1000.
+                normalized = normalize_bbox_to_1000(
+                    raw_bbox, image_width, image_height
+                )
+            elif pre_normalized is not None:
+                normalized = [round(c, 4) for c in pre_normalized]
+            elif raw_bbox is not None:
+                # No image size: if coords already look like 0–1000, keep them.
+                max_coord = max(abs(c) for c in raw_bbox)
+                if max_coord <= NORMALIZED_BBOX_SCALE * 1.05:
+                    normalized = [round(c, 4) for c in raw_bbox]
+                    raw_bbox = None
+
+            # Zero box → treat as missing geometry.
+            if raw_bbox is not None and all(c == 0 for c in raw_bbox):
+                raw_bbox = None
+            if normalized is not None and all(c == 0 for c in normalized):
+                normalized = None
+
+            fields[fdef.name] = {
+                "value": value,
+                "bbox_2d": raw_bbox,
+                "normalized_bbox": normalized,
+                "confidence": confidence,
+                "page": page,
+            }
 
         full_text = parsed.get("full_text")
         if full_text is None and "full_text_ocr" in fields:
-            full_text = fields.get("full_text_ocr", "")
+            full_text_entry = fields.get("full_text_ocr", {})
+            if isinstance(full_text_entry, dict):
+                full_text = full_text_entry.get("value", "")
+            else:
+                full_text = full_text_entry or ""
         summary = parsed.get("summary")
         if summary is None and "summary" in fields:
-            summary = fields.get("summary", "")
+            summary_entry = fields.get("summary", {})
+            if isinstance(summary_entry, dict):
+                summary = summary_entry.get("value", "")
+            else:
+                summary = summary_entry or ""
+
+        image_meta: dict[str, Any] = {}
+        if image_width is not None and image_height is not None:
+            try:
+                image_meta = {
+                    "width": int(image_width),
+                    "height": int(image_height),
+                }
+            except (TypeError, ValueError):
+                image_meta = {}
+
+        payload: dict[str, Any] = {
+            "full_text": str(full_text or ""),
+            "summary": str(summary or ""),
+            "fields": fields,
+        }
+        if image_meta:
+            payload["image_size"] = image_meta
 
         envelope: dict[str, Any] = {
             "class_id": schema.class_id,
             "form_type": schema.class_id,
             "display_name": schema.display_name,
-            "extracted_payload": {
-                "full_text": str(full_text or ""),
-                "summary": str(summary or ""),
-                "fields": fields,
-            },
+            "extracted_payload": payload,
         }
 
         # Promote familiar medical keys for legacy HITL / tests when present.
         for legacy_key in ("patient_name", "dob"):
-            if legacy_key in fields and fields[legacy_key]:
-                envelope[legacy_key] = str(fields[legacy_key])
+            entry = fields.get(legacy_key)
+            if isinstance(entry, dict) and entry.get("value"):
+                envelope[legacy_key] = str(entry["value"])
 
         return envelope
 
@@ -625,7 +838,9 @@ __all__ = [
     "DocumentSchema",
     "FALLBACK_CLASS_ID",
     "FieldDefinition",
+    "NORMALIZED_BBOX_SCALE",
     "SchemaRegistry",
     "get_schema_registry",
+    "normalize_bbox_to_1000",
     "schemas_to_typescript",
 ]

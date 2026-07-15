@@ -19,6 +19,8 @@ import { isPdfFileName } from "@/lib/types";
 export type PdfFieldHighlight = {
   key: string;
   bbox: FieldBBox;
+  /** Confidence in [0, 1] when known. */
+  confidence?: number | null;
 };
 
 interface PdfJsViewerProps {
@@ -42,16 +44,52 @@ type PageMetrics = {
   cssHeight: number;
 };
 
+/**
+ * Map stored bbox → CSS pixels relative to the rendered page element.
+ *
+ * Supports three spaces:
+ * - ``normalized_1000`` / Qwen 0–1000: left = (x1/1000)*width, …
+ * - fractional (≤1): left = x * width
+ * - absolute PDF units: multiplied by ``scale`` into CSS pixels
+ */
 function resolveBoxRect(
   bbox: FieldBBox,
   pageWidth: number,
   pageHeight: number,
+  scale = 1,
 ): { left: number; top: number; width: number; height: number } {
-  const fractional =
-    Math.max(Math.abs(bbox.x), Math.abs(bbox.y), Math.abs(bbox.w), Math.abs(bbox.h)) <=
-    1.0001;
+  const maxAbs = Math.max(
+    Math.abs(bbox.x),
+    Math.abs(bbox.y),
+    Math.abs(bbox.w),
+    Math.abs(bbox.h),
+    Math.abs(bbox.x + bbox.w),
+    Math.abs(bbox.y + bbox.h),
+  );
 
-  if (fractional) {
+  const space =
+    bbox.space ??
+    (maxAbs <= 1.0001
+      ? "fractional"
+      : maxAbs <= 1000.05
+        ? "normalized_1000"
+        : "absolute");
+
+  if (space === "normalized_1000") {
+    // FieldBBox stores x/y/w/h where x,y are x1,y1 and w,h are deltas.
+    const x1 = bbox.x;
+    const y1 = bbox.y;
+    const x2 = bbox.x + bbox.w;
+    const y2 = bbox.y + bbox.h;
+    return {
+      left: (x1 / 1000) * pageWidth,
+      top: (y1 / 1000) * pageHeight,
+      width: ((x2 - x1) / 1000) * pageWidth,
+      height: ((y2 - y1) / 1000) * pageHeight,
+    };
+  }
+
+  if (space === "fractional") {
     return {
       left: bbox.x * pageWidth,
       top: bbox.y * pageHeight,
@@ -60,13 +98,21 @@ function resolveBoxRect(
     };
   }
 
-  // Absolute PDF user-space units (origin top-left for vision extractors).
+  // Absolute PDF user-space units → CSS via render scale.
   return {
-    left: bbox.x,
-    top: bbox.y,
-    width: bbox.w,
-    height: bbox.h,
+    left: bbox.x * scale,
+    top: bbox.y * scale,
+    width: bbox.w * scale,
+    height: bbox.h * scale,
   };
+}
+
+function confidenceLabel(confidence: number | null | undefined): string | null {
+  if (confidence == null || Number.isNaN(confidence)) {
+    return null;
+  }
+  const pct = Math.round((confidence > 1 ? confidence : confidence * 100));
+  return `${Math.max(0, Math.min(100, pct))}% confident`;
 }
 
 async function ensurePdfjs() {
@@ -445,28 +491,45 @@ export function PdfJsViewer({
                 />
                 {metrics &&
                   pageHighlights.map((item) => {
+                    // Convert 0–1000 (or fractional) coords into CSS pixels of
+                    // the displayed page element.
                     const rect = resolveBoxRect(
                       item.bbox,
-                      metrics.width,
-                      metrics.height,
+                      metrics.cssWidth,
+                      metrics.cssHeight,
+                      scale,
                     );
                     const active = item.key === activeFieldKey;
+                    const tip = confidenceLabel(item.confidence);
                     return (
                       <div
                         key={item.key}
                         data-bbox-key={item.key}
-                        className={`pointer-events-none absolute rounded-sm border-2 transition-all duration-200 ${
+                        title={tip ?? undefined}
+                        className={`group absolute rounded-sm border-2 transition-all duration-200 ${
                           active
-                            ? "z-20 border-accent bg-accent/25 shadow-[0_0_0_2px_rgba(59,130,246,0.35)]"
-                            : "z-10 border-success/70 bg-success/10"
+                            ? "z-20 border-blue-500 bg-yellow-300/55 shadow-[0_0_0_2px_rgba(59,130,246,0.45)]"
+                            : "pointer-events-auto z-10 border-emerald-500/70 bg-emerald-400/15 hover:border-blue-400 hover:bg-yellow-200/35"
                         }`}
                         style={{
-                          left: rect.left * scale,
-                          top: rect.top * scale,
-                          width: Math.max(2, rect.width * scale),
-                          height: Math.max(2, rect.height * scale),
+                          left: rect.left,
+                          top: rect.top,
+                          width: Math.max(2, rect.width),
+                          height: Math.max(2, rect.height),
                         }}
-                      />
+                      >
+                        {tip && (
+                          <span
+                            className={`pointer-events-none absolute -top-6 left-0 whitespace-nowrap rounded bg-black/80 px-1.5 py-0.5 text-[10px] font-medium text-white transition ${
+                              active
+                                ? "opacity-100"
+                                : "opacity-0 group-hover:opacity-100"
+                            }`}
+                          >
+                            {tip}
+                          </span>
+                        )}
+                      </div>
                     );
                   })}
                 <span className="absolute bottom-2 right-2 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white/80">
@@ -488,38 +551,75 @@ function ImageBBoxOverlay({
   highlights: PdfFieldHighlight[];
   activeFieldKey: string | null;
 }) {
-  // Image previews treat bbox as fractions of natural image size via % positioning.
+  // Image previews: map 0–1000 / fractional boxes onto % of the image box.
   return (
     <>
       {highlights.map((item) => {
         const { bbox } = item;
-        const fractional =
-          Math.max(
-            Math.abs(bbox.x),
-            Math.abs(bbox.y),
-            Math.abs(bbox.w),
-            Math.abs(bbox.h),
-          ) <= 1.0001;
-        if (!fractional) {
+        const maxAbs = Math.max(
+          Math.abs(bbox.x),
+          Math.abs(bbox.y),
+          Math.abs(bbox.w),
+          Math.abs(bbox.h),
+          Math.abs(bbox.x + bbox.w),
+          Math.abs(bbox.y + bbox.h),
+        );
+        const space =
+          bbox.space ??
+          (maxAbs <= 1.0001
+            ? "fractional"
+            : maxAbs <= 1000.05
+              ? "normalized_1000"
+              : "absolute");
+        if (space === "absolute") {
           return null;
         }
+
+        let leftPct: number;
+        let topPct: number;
+        let widthPct: number;
+        let heightPct: number;
+        if (space === "normalized_1000") {
+          leftPct = (bbox.x / 1000) * 100;
+          topPct = (bbox.y / 1000) * 100;
+          widthPct = (bbox.w / 1000) * 100;
+          heightPct = (bbox.h / 1000) * 100;
+        } else {
+          leftPct = bbox.x * 100;
+          topPct = bbox.y * 100;
+          widthPct = bbox.w * 100;
+          heightPct = bbox.h * 100;
+        }
+
         const active = item.key === activeFieldKey;
+        const tip = confidenceLabel(item.confidence);
         return (
           <div
             key={item.key}
             data-bbox-key={item.key}
-            className={`pointer-events-none absolute rounded-sm border-2 transition-all duration-200 ${
+            title={tip ?? undefined}
+            className={`group absolute rounded-sm border-2 transition-all duration-200 ${
               active
-                ? "z-20 border-accent bg-accent/25"
-                : "z-10 border-success/70 bg-success/10"
+                ? "z-20 border-blue-500 bg-yellow-300/55"
+                : "pointer-events-auto z-10 border-emerald-500/70 bg-emerald-400/15 hover:border-blue-400 hover:bg-yellow-200/35"
             }`}
             style={{
-              left: `${bbox.x * 100}%`,
-              top: `${bbox.y * 100}%`,
-              width: `${bbox.w * 100}%`,
-              height: `${bbox.h * 100}%`,
+              left: `${leftPct}%`,
+              top: `${topPct}%`,
+              width: `${widthPct}%`,
+              height: `${heightPct}%`,
             }}
-          />
+          >
+            {tip && (
+              <span
+                className={`pointer-events-none absolute -top-6 left-0 whitespace-nowrap rounded bg-black/80 px-1.5 py-0.5 text-[10px] font-medium text-white transition ${
+                  active ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                }`}
+              >
+                {tip}
+              </span>
+            )}
+          </div>
         );
       })}
     </>
