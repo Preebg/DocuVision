@@ -145,6 +145,167 @@ def _detail_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+_PRIORITY_LABELS: dict[int, str] = {
+    1: "Low",
+    2: "Medium",
+    3: "High",
+}
+_PENDING_DB_STATUS = "PENDING_VERIFICATION"
+
+
+def _priority_label(priority: int | None) -> str:
+    if priority is None:
+        return "Medium"
+    return _PRIORITY_LABELS.get(int(priority), "Medium")
+
+
+def _batch_display_number(batch_id: str) -> str:
+    """Compact operator-facing batch tag (e.g. Batch #A1B2C3)."""
+    compact = batch_id.replace("-", "").upper()
+    return compact[:6] if compact else batch_id[:8]
+
+
+def _batch_nav_for_document(
+    connection: sqlite3.Connection,
+    doc_id: str,
+) -> dict[str, Any]:
+    """Resolve sequence-based prev/next IDs within the document's batch."""
+    empty = {
+        "batch_id": None,
+        "batch_name": None,
+        "batch_display": None,
+        "sequence_no": None,
+        "batch_document_count": None,
+        "prev_document_id": None,
+        "next_document_id": None,
+    }
+    membership = connection.execute(
+        """
+        SELECT
+            bd.batch_id AS batch_id,
+            bd.sequence_no AS sequence_no,
+            b.name AS batch_name
+        FROM batch_documents bd
+        INNER JOIN batches b ON b.id = bd.batch_id
+        WHERE bd.document_id = ?
+        ORDER BY b.created_at ASC
+        LIMIT 1
+        """,
+        (doc_id,),
+    ).fetchone()
+    if membership is None:
+        return empty
+
+    batch_id = str(membership["batch_id"])
+    peers = connection.execute(
+        """
+        SELECT document_id, sequence_no
+        FROM batch_documents
+        WHERE batch_id = ?
+        ORDER BY sequence_no ASC, document_id ASC
+        """,
+        (batch_id,),
+    ).fetchall()
+    if not peers:
+        return empty
+
+    ids = [str(row["document_id"]) for row in peers]
+    try:
+        index = ids.index(doc_id)
+    except ValueError:
+        return empty
+
+    sequence_no = int(peers[index]["sequence_no"])
+    # Next pending after this document (for auto-advance after Approve).
+    next_pending_id: str | None = None
+    for peer_id in ids[index + 1 :]:
+        status_row = connection.execute(
+            "SELECT status FROM documents WHERE id = ?",
+            (peer_id,),
+        ).fetchone()
+        if status_row and status_row["status"] == _PENDING_DB_STATUS:
+            next_pending_id = peer_id
+            break
+
+    return {
+        "batch_id": batch_id,
+        "batch_name": membership["batch_name"],
+        "batch_display": _batch_display_number(batch_id),
+        "sequence_no": sequence_no,
+        "batch_document_count": len(peers),
+        "prev_document_id": ids[index - 1] if index > 0 else None,
+        "next_document_id": ids[index + 1] if index + 1 < len(ids) else None,
+        "next_pending_document_id": next_pending_id,
+    }
+
+
+def _list_pending_batches(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Unique batches with ≥1 document still in PENDING_VERIFICATION."""
+    rows = connection.execute(
+        """
+        SELECT
+            b.id AS batch_id,
+            b.name AS name,
+            b.priority AS priority,
+            COUNT(bd.document_id) AS total_documents,
+            SUM(
+                CASE WHEN d.status = ? THEN 1 ELSE 0 END
+            ) AS pending_documents,
+            MIN(d.created_at) AS created_at
+        FROM batches b
+        INNER JOIN batch_documents bd ON bd.batch_id = b.id
+        INNER JOIN documents d ON d.id = bd.document_id
+        GROUP BY b.id
+        HAVING SUM(CASE WHEN d.status = ? THEN 1 ELSE 0 END) > 0
+        ORDER BY b.priority DESC, MIN(d.created_at) ASC
+        """,
+        (_PENDING_DB_STATUS, _PENDING_DB_STATUS),
+    ).fetchall()
+
+    batches: list[dict[str, Any]] = []
+    for row in rows:
+        batch_id = str(row["batch_id"])
+        first_pending = connection.execute(
+            """
+            SELECT bd.document_id AS document_id
+            FROM batch_documents bd
+            INNER JOIN documents d ON d.id = bd.document_id
+            WHERE bd.batch_id = ?
+              AND d.status = ?
+            ORDER BY bd.sequence_no ASC, d.created_at ASC
+            LIMIT 1
+            """,
+            (batch_id, _PENDING_DB_STATUS),
+        ).fetchone()
+        batches.append(
+            {
+                "batch_id": batch_id,
+                "name": row["name"],
+                "priority": _priority_label(row["priority"]),
+                "total_documents": int(row["total_documents"] or 0),
+                "pending_documents": int(row["pending_documents"] or 0),
+                "created_at": row["created_at"],
+                "first_pending_document_id": (
+                    str(first_pending["document_id"]) if first_pending else None
+                ),
+                "batch_display": _batch_display_number(batch_id),
+            }
+        )
+    return batches
+
+
+def _strip_route(app: FastAPI, path: str, methods: set[str]) -> None:
+    """Remove a previously registered route so HITL handlers can replace it."""
+    kept = []
+    for route in app.router.routes:
+        route_path = getattr(route, "path", None)
+        route_methods = set(getattr(route, "methods", None) or set())
+        if route_path == path and route_methods.intersection(methods):
+            continue
+        kept.append(route)
+    app.router.routes = kept
+
+
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
@@ -190,6 +351,18 @@ def create_hitl_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Replace the supervisor-oriented pending summary with the HITL batch queue.
+    _strip_route(app, "/api/batches/pending", {"GET"})
+
+    @app.get("/api/batches/pending")
+    def list_pending_batches() -> list[dict[str, Any]]:
+        """Batches with at least one document awaiting clerk verification."""
+        connection = get_connection()
+        try:
+            return _list_pending_batches(connection)
+        finally:
+            connection.close()
+
     @app.get("/api/documents")
     def list_documents(
         status: str = Query(default="VERIFYING"),
@@ -214,7 +387,7 @@ def create_hitl_app() -> FastAPI:
 
     @app.get("/api/documents/{doc_id}")
     def get_document(doc_id: str) -> dict[str, Any]:
-        """Return the full document row with ``extracted_json`` as an object."""
+        """Return document detail plus batch sequence navigation IDs."""
         connection = get_connection()
         try:
             cursor = connection.execute(
@@ -228,7 +401,9 @@ def create_hitl_app() -> FastAPI:
             row = cursor.fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail="Document not found.")
-            return _detail_from_row(row)
+            detail = _detail_from_row(row)
+            detail.update(_batch_nav_for_document(connection, doc_id))
+            return detail
         finally:
             connection.close()
 

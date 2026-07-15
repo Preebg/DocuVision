@@ -66,6 +66,7 @@ export default function HomePage() {
     return (
       <VerificationDashboard
         documentId={documentId}
+        onNavigateDocument={openDocument}
         onReleased={backToQueue}
         onBackToQueue={backToQueue}
       />

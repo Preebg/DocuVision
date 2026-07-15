@@ -112,6 +112,21 @@ export type HitlDocumentListItem = {
   created_at: string;
 };
 
+export type HitlBatchPriority = "High" | "Medium" | "Low";
+
+export type HitlPendingBatch = {
+  batch_id: string;
+  name: string;
+  priority: HitlBatchPriority | string;
+  total_documents: number;
+  pending_documents: number;
+  created_at: string;
+  /** First PENDING_VERIFICATION document in sequence order. */
+  first_pending_document_id: string | null;
+  /** Compact operator-facing tag (e.g. A1B2C3). */
+  batch_display: string;
+};
+
 export type HitlDocumentDetail = {
   id: string;
   filename: string;
@@ -122,6 +137,16 @@ export type HitlDocumentDetail = {
   file_path: string | null;
   /** Projected from metadata.extracted_payload (object, not double-encoded). */
   extracted_json: unknown;
+  /** Batch membership + sequence navigation (null when not in a batch). */
+  batch_id?: string | null;
+  batch_name?: string | null;
+  batch_display?: string | null;
+  sequence_no?: number | null;
+  batch_document_count?: number | null;
+  prev_document_id?: string | null;
+  next_document_id?: string | null;
+  /** Next PENDING_VERIFICATION document after this one in batch sequence. */
+  next_pending_document_id?: string | null;
 };
 
 export type HitlVerifyResponse = {
@@ -144,6 +169,26 @@ export async function fetchHitlDocuments(
     throw new Error(`Documents list failed (${response.status})`);
   }
   return (await response.json()) as HitlDocumentListItem[];
+}
+
+export async function fetchPendingBatches(
+  signal?: AbortSignal,
+): Promise<HitlPendingBatch[]> {
+  const response = await fetch(apiUrl("/api/batches/pending"), {
+    method: "GET",
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`Pending batches failed (${response.status})`);
+  }
+  const payload = (await response.json()) as
+    | HitlPendingBatch[]
+    | { batches: HitlPendingBatch[] };
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  return payload.batches ?? [];
 }
 
 export async function fetchHitlDocument(

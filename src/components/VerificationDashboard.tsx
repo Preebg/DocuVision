@@ -31,6 +31,8 @@ import {
 export type VerificationDashboardProps = {
   /** Document id from the BatchWorkbench selection. */
   documentId: string;
+  /** Flip to another document in the same batch (sequence prev/next). */
+  onNavigateDocument?: (id: string) => void;
   /** Called after a successful Approve & Release so the app can return to the queue. */
   onReleased?: () => void;
   /** Optional explicit back navigation to BatchWorkbench. */
@@ -39,6 +41,7 @@ export type VerificationDashboardProps = {
 
 export function VerificationDashboard({
   documentId,
+  onNavigateDocument,
   onReleased,
   onBackToQueue,
 }: VerificationDashboardProps) {
@@ -153,8 +156,17 @@ export function VerificationDashboard({
     try {
       const corrected = buildCorrectedData(extractedSource, formValues);
       await verifyHitlDocument(document.id, corrected);
+      const nextPendingId = document.next_pending_document_id ?? null;
       setSuccessFlash(true);
       window.setTimeout(() => {
+        savingRef.current = false;
+        setSaving(false);
+        setSuccessFlash(false);
+        if (nextPendingId && onNavigateDocument) {
+          onNavigateDocument(nextPendingId);
+          return;
+        }
+        // Last pending document in the batch (or standalone) → workbench.
         onReleased?.();
         onBackToQueue?.();
       }, 350);
@@ -167,7 +179,14 @@ export function VerificationDashboard({
       savingRef.current = false;
       setSaving(false);
     }
-  }, [document, extractedSource, formValues, onBackToQueue, onReleased]);
+  }, [
+    document,
+    extractedSource,
+    formValues,
+    onBackToQueue,
+    onNavigateDocument,
+    onReleased,
+  ]);
 
   const focusFieldAtIndex = useCallback(
     (index: number) => {
@@ -192,6 +211,20 @@ export function VerificationDashboard({
 
   const documentUrl = document ? documentFileUrl(document.id) : null;
   const fileName = document?.filename ?? null;
+
+  const batchId = document?.batch_id ?? null;
+  const batchDisplay =
+    document?.batch_display ??
+    (batchId ? batchId.replace(/-/g, "").slice(0, 6).toUpperCase() : null);
+  const sequenceNo = document?.sequence_no ?? null;
+  const batchCount = document?.batch_document_count ?? null;
+  const inBatch =
+    Boolean(batchId) &&
+    typeof sequenceNo === "number" &&
+    typeof batchCount === "number" &&
+    batchCount > 0;
+  const prevDocumentId = document?.prev_document_id ?? null;
+  const nextDocumentId = document?.next_document_id ?? null;
 
   if (loading) {
     return (
@@ -236,6 +269,42 @@ export function VerificationDashboard({
           : "shadow-[inset_0_0_0_0_transparent]"
       }`}
     >
+      {inBatch && (
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-surface-elevated px-5 py-2.5">
+          <p className="min-w-0 truncate text-xs text-foreground">
+            Document{" "}
+            <span className="font-semibold tabular-nums">{sequenceNo}</span> of{" "}
+            <span className="font-semibold tabular-nums">{batchCount}</span> in
+            Batch #{batchDisplay}
+            {document.batch_name ? (
+              <span className="text-muted"> · {document.batch_name}</span>
+            ) : null}
+          </p>
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              onClick={() =>
+                prevDocumentId && onNavigateDocument?.(prevDocumentId)
+              }
+              disabled={saving || !prevDocumentId || !onNavigateDocument}
+              className="rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted transition hover:bg-surface hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Back
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                nextDocumentId && onNavigateDocument?.(nextDocumentId)
+              }
+              disabled={saving || !nextDocumentId || !onNavigateDocument}
+              className="rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted transition hover:bg-surface hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      )}
+
       <header className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-surface px-5 py-3">
         <div className="min-w-0">
           <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-accent">
