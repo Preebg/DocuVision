@@ -1,0 +1,46 @@
+# DocuVision Pillar 1 — Advanced Local Ingestion sources
+#
+# Each entry is an autonomous drop target (scanner share, NFS mount, or
+# local spool). The ingestion daemon (run_ingestion.py) watches these paths
+# and packages stable files into Batches via StorageBackend.write_incoming_batch.
+#
+# Path rules:
+#   - /data/... and relative paths (drops/...) resolve against DOCUVISION_DATA_ROOT
+#     so the same file works in Docker (/data) and on Windows host runs.
+#   - Other absolute paths (/mnt/..., D:\scans) are used as-is.
+#
+# Override registry path with DOCUVISION_INGESTION_SOURCES_PATH.
+
+sources:
+  # High-performance local spool — OS filesystem events (watchdog) when available.
+  - source_id: scanner_local_a
+    display_name: Primary Scanner Spool
+    type: local_directory
+    path: /data/drops/scanner_a
+    batch_priority: 3
+    polling_interval_seconds: 5
+    file_filters:
+      - .pdf
+      - .tiff
+      - .tif
+      - .jpg
+      - .jpeg
+      - .png
+    quarantine_path: /data/quarantine/scanner_a
+    # Optional: merge files that land within this window (seconds).
+    batch_window_seconds: 5
+
+  # Optional second source — leave disabled on laptops without this mount.
+  # Network share mount (SMB/NFS) — heartbeat poll only; never crash on blips.
+  # - source_id: clinic_share_nfs
+  #   display_name: Clinic Records Share
+  #   type: network_share_poll
+  #   path: /mnt/clinic_records/incoming
+  #   batch_priority: 2
+  #   polling_interval_seconds: 10
+  #   file_filters:
+  #     - .pdf
+  #     - .tiff
+  #     - .tif
+  #   quarantine_path: /data/quarantine/clinic_share
+  #   batch_window_seconds: 5

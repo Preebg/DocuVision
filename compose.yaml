@@ -1,11 +1,14 @@
 # DocuVision local air-gapped stack
 #
 # Worker (pipeline):  docker compose up --build worker
+# Ingestion daemon:   docker compose up --build ingestion
 # API + static UI:    docker compose up --build api web
 # Full stack:         docker compose up --build
 # With local Ollama:  docker compose --profile ollama up --build
 #
-# Drop PDFs/images into ./data/incoming — the worker polls that folder.
+# Scanner / NFS drops: configure paths in config/ingestion_sources.yaml
+# (mounted read-only). The ingestion service moves files into /data/incoming
+# as Migration 002 batches; the worker claims queued jobs from there.
 # Point DOCUVISION_OLLAMA_BASE_URL at your Mini PC or host Ollama.
 # SPA talks to FastAPI via NEXT_PUBLIC_API_BASE_URL (browser-reachable host).
 
@@ -28,6 +31,25 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
+  ingestion:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "run_ingestion.py"]
+    volumes:
+      - ./data:/data
+      - ./config/ingestion_sources.yaml:/app/config/ingestion_sources.yaml:ro
+      # Bind host scanner / NFS mounts declared in ingestion_sources.yaml, e.g.:
+      # - /mnt/clinic_records:/mnt/clinic_records
+      # - ./data/drops:/data/drops
+      - ./data/drops:/data/drops
+      - ./data/quarantine:/data/quarantine
+    environment:
+      DOCUVISION_DATA_ROOT: /data
+      DOCUVISION_DATABASE_URL: ${DOCUVISION_DATABASE_URL:-}
+      DOCUVISION_INGESTION_SOURCES_PATH: /app/config/ingestion_sources.yaml
+    restart: unless-stopped
+
   api:
     build:
       context: .
@@ -35,12 +57,14 @@ services:
     command: ["python", "run_api.py"]
     volumes:
       - ./data:/data
+      - ./config/ingestion_sources.yaml:/app/config/ingestion_sources.yaml:ro
     ports:
       - "${API_PORT:-8000}:8000"
     environment:
       DOCUVISION_DATA_ROOT: /data
       DOCUVISION_DATABASE_URL: ${DOCUVISION_DATABASE_URL:-}
       DOCUVISION_API_CORS_ORIGINS: ${DOCUVISION_API_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,tauri://localhost}
+      DOCUVISION_INGESTION_SOURCES_PATH: /app/config/ingestion_sources.yaml
     restart: unless-stopped
 
   web:

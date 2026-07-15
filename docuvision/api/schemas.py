@@ -85,3 +85,33 @@ class BatchPendingResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     repository: str
+
+
+class IngestionSourceStatusOut(BaseModel):
+    source_id: str
+    display_name: str
+    type: str
+    path: str
+    online: bool
+    health: str
+    queue_depth: int
+    last_poll_at: str | None = None
+    last_ingest_at: str | None = None
+    last_error: str | None = None
+    batches_formed: int = 0
+    files_ingested: int = 0
+    files_quarantined: int = 0
+    listener: str = "none"
+
+
+class IngestionStatusResponse(BaseModel):
+    """Pillar 1 heartbeat — daemon liveness + per-source queue depth."""
+
+    daemon: str = "ingestion-watcher"
+    running: bool = False
+    online: bool = False
+    started_at: str | None = None
+    updated_at: str | None = None
+    stale: bool = True
+    total_queue_depth: int = 0
+    sources: list[IngestionSourceStatusOut] = Field(default_factory=list)

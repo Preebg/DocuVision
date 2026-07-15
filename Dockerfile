@@ -23,8 +23,10 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY docuvision ./docuvision
 COPY migrations ./migrations
 COPY contracts ./contracts
+COPY config ./config
 COPY run_worker.py .
 COPY run_api.py .
+COPY run_ingestion.py .
 
 ENV PYTHONUNBUFFERED=1 \
     DOCUVISION_DATA_ROOT=/data
