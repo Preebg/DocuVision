@@ -3,7 +3,7 @@
 Production runtime: ``python run_api.py`` (sole bind on DOCUVISION_API_HOST:PORT).
 
 Do not start this module directly with uvicorn; use ``run_api.py`` so HITL
-queue/detail/verify projections are registered on the same app instance.
+queue/detail projections are registered on the same app instance.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from docuvision.adapters.postgres_repository import PostgresPipelineRepository
 from docuvision.api.auth import install_api_auth
+from docuvision.api import operator_auth
 from docuvision.api.routes import batches, documents, ingestion, queue
 from docuvision.api.schemas import HealthResponse
 from docuvision.composition import build_backends, build_release_engine, build_release_exporter
@@ -76,6 +77,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(queue.router)
+    app.include_router(operator_auth.router)
     app.include_router(documents.router)
     app.include_router(batches.router)
     app.include_router(ingestion.router)

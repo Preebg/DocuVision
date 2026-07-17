@@ -2,3 +2,12 @@
 identifier = "allow-read-local-api-token"
 description = "Allow the SPA to read the FastAPI session token.lock hand-off."
 commands.allow = ["read_local_api_token"]
+
+[[permission]]
+identifier = "allow-operator-session-keyring"
+description = "Allow the SPA to manage its on-prem operator session in the OS credential store."
+commands.allow = [
+  "write_operator_session",
+  "read_operator_session",
+  "delete_operator_session",
+]

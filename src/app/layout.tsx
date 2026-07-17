@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import { OperatorSessionGate } from "@/components/OperatorSessionGate";
 import { Sidebar } from "@/components/Sidebar";
 import "./globals.css";
 
@@ -30,10 +31,12 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
       >
-        <div className="flex h-full min-h-screen bg-background">
-          <Sidebar />
-          <main className="min-w-0 flex-1 overflow-hidden">{children}</main>
-        </div>
+        <OperatorSessionGate>
+          <div className="flex h-full min-h-screen bg-background">
+            <Sidebar />
+            <main className="min-w-0 flex-1 overflow-hidden">{children}</main>
+          </div>
+        </OperatorSessionGate>
       </body>
     </html>
   );

@@ -1,4 +1,4 @@
-import { getOperatorIdentity } from "@/lib/types";
+import { getOperatorAccessToken } from "@/lib/operator-session";
 
 /** Base URL for the local FastAPI service (static SPA / Tauri). */
 export function getApiBaseUrl(): string {
@@ -77,13 +77,17 @@ export async function getLocalApiKey(): Promise<string> {
   }
 }
 
-/** Auth headers for every request to the local FastAPI loopback API. */
+/** Desktop handshake + cryptographic operator auth for every API request. */
 export async function apiAuthHeaders(
   extra?: HeadersInit,
 ): Promise<Record<string, string>> {
-  const token = await getLocalApiKey();
+  const [localToken, operatorToken] = await Promise.all([
+    getLocalApiKey(),
+    getOperatorAccessToken(),
+  ]);
   const headers: Record<string, string> = {
-    [API_KEY_HEADER]: token,
+    [API_KEY_HEADER]: localToken,
+    Authorization: `Bearer ${operatorToken}`,
   };
   if (extra) {
     const merged = new Headers(extra);
@@ -95,7 +99,7 @@ export async function apiAuthHeaders(
 }
 
 /**
- * Authenticated fetch against the local API (injects ``X-API-Key``).
+ * Authenticated fetch (injects local handshake and operator Bearer JWT).
  * Does not force ``Content-Type`` so ``FormData`` uploads keep their boundary.
  */
 export async function apiFetch(
@@ -151,53 +155,25 @@ export async function ingestDocument(file: File): Promise<{
 export type DocumentPatchBody = {
   action: "approve" | "reject";
   verified_payload?: import("@/lib/types").ExtractedPayload | null;
-  /** Clerk / operator identity (LAN username, machine id, or email). */
-  verified_by?: string;
-  actor?: string;
   reject_reason?: string | null;
 };
-
-const OPERATOR_HEADER = "X-Operator-Identity";
 
 export async function patchDocument(
   id: string,
   body: DocumentPatchBody,
 ): Promise<import("@/lib/types").DocumentPipelineRow> {
-  const operator =
-    body.verified_by?.trim() ||
-    body.actor?.trim() ||
-    getOperatorIdentity();
-
-  const payload: DocumentPatchBody = {
-    ...body,
-    verified_by: operator,
-    actor: operator,
-  };
-
   const response = await apiFetch(`/api/documents/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
-      [OPERATOR_HEADER]: operator,
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
   if (!response.ok) {
     const detail = await response.text();
     throw new Error(detail || `Update failed (${response.status})`);
   }
   return (await response.json()) as import("@/lib/types").DocumentPipelineRow;
-}
-
-/**
- * Authenticated streaming URL for PDF/image bytes.
- * Appends ``api_key`` so ``<img>`` / naive URL loads still pass the gate.
- */
-export async function documentFileUrl(id: string): Promise<string> {
-  const token = await getLocalApiKey();
-  const url = new URL(apiUrl(`/api/documents/${encodeURIComponent(id)}/file`));
-  url.searchParams.set("api_key", token);
-  return url.toString();
 }
 
 /**
@@ -341,19 +317,15 @@ export async function verifyHitlDocument(
   id: string,
   correctedData: Record<string, unknown>,
 ): Promise<HitlVerifyResponse> {
-  const response = await apiFetch(
-    `/api/documents/${encodeURIComponent(id)}/verify`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ corrected_data: correctedData }),
-    },
-  );
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(detail || `Verify failed (${response.status})`);
-  }
-  return (await response.json()) as HitlVerifyResponse;
+  const document = await patchDocument(id, {
+    action: "approve",
+    verified_payload: correctedData,
+  });
+  return {
+    status: "success",
+    id: document.id,
+    document_status: document.status ?? "VERIFIED",
+  };
 }
 
 export async function fetchHealth(signal?: AbortSignal): Promise<{

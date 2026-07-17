@@ -112,6 +112,32 @@ class Settings(BaseSettings):
             "per-user token.lock file."
         ),
     )
+    operator_auth_db_path: Path | None = Field(
+        default=None,
+        description="Local operator credential/session database path.",
+    )
+    operator_signing_key_path: Path | None = Field(
+        default=None,
+        description="Local Ed25519 private signing key path.",
+    )
+    operator_jwt_issuer: str = Field(
+        default="docuvision://on-prem/operator-auth",
+        description="Exact issuer for locally signed operator JWTs.",
+    )
+    operator_jwt_audience: str = Field(
+        default="docuvision-api",
+        description="Required operator access-token audience.",
+    )
+    operator_access_token_seconds: int = Field(default=300, ge=60, le=900)
+    operator_refresh_token_seconds: int = Field(
+        default=28_800,
+        ge=900,
+        le=86_400,
+    )
+    operator_password_min_length: int = Field(default=14, ge=12, le=128)
+    operator_max_failed_attempts: int = Field(default=5, ge=3, le=20)
+    operator_lockout_seconds: int = Field(default=900, ge=60, le=86_400)
+    operator_jwt_leeway_seconds: int = Field(default=30, ge=0, le=300)
 
     # -- Mini PC Ollama (network-pluggable) -------------------------------
     ollama_base_url: str = Field(
@@ -189,9 +215,12 @@ class Settings(BaseSettings):
     def _normalize_ollama_url(cls, value: str) -> str:
         return value.rstrip("/")
 
-    @field_validator("database_url", mode="before")
+    @field_validator(
+        "database_url",
+        mode="before",
+    )
     @classmethod
-    def _empty_database_url_to_none(cls, value: object) -> object:
+    def _empty_optional_string_to_none(cls, value: object) -> object:
         if value is None:
             return None
         if isinstance(value, str) and not value.strip():
@@ -223,6 +252,14 @@ class Settings(BaseSettings):
     def resolved_sqlite_path(self) -> Path:
         return self.sqlite_path or (self.data_root / "docuvision.db")
 
+    def resolved_operator_auth_db_path(self) -> Path:
+        return self.operator_auth_db_path or (self.data_root / "auth" / "operators.db")
+
+    def resolved_operator_signing_key_path(self) -> Path:
+        return self.operator_signing_key_path or (
+            self.data_root / "auth" / "operator-signing-key.pem"
+        )
+
     def resolved_schemas_dir(self) -> Path:
         if self.schemas_dir is not None:
             return self.schemas_dir
@@ -251,6 +288,8 @@ class Settings(BaseSettings):
             self.resolved_release_dir(),
             self.resolved_ingestion_archive_dir(),
             self.resolved_ingestion_status_path().parent,
+            self.resolved_operator_auth_db_path().parent,
+            self.resolved_operator_signing_key_path().parent,
         ):
             path.mkdir(parents=True, exist_ok=True)
         self.resolved_sqlite_path().parent.mkdir(parents=True, exist_ok=True)

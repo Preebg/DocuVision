@@ -10,13 +10,14 @@ import fitz
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import LOCAL_API_HEADERS
+from conftest import operator_auth_headers
 from docuvision.adapters.local_storage import LocalStorageAdapter
 from docuvision.adapters.release import FSDropExporter
 from docuvision.adapters.sqlite_repository import SqlitePipelineRepository
 from docuvision.api.main import create_app
 from docuvision.composition import build_release_engine
-from docuvision.config.settings import Settings
+from docuvision.config.settings import Settings, get_settings
+from docuvision.api.operator_auth import reset_operator_auth_caches
 from docuvision.core.errors import ReleaseExportError
 from docuvision.core.models import BatchStatus, PipelineStatus
 from docuvision.core.release import ReleaseEngine
@@ -180,7 +181,10 @@ async def test_release_engine_marks_release_failed_without_raising(
     assert still.status == PipelineStatus.VERIFIED
 
 
-def test_approve_and_release_api_hook(tmp_path: Path) -> None:
+def test_approve_and_release_api_hook(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DOCUVISION_DATA_ROOT", str(tmp_path / "auth-data"))
+    get_settings.cache_clear()
+    reset_operator_auth_caches()
     settings = Settings(
         data_root=tmp_path / "data",
         release_dir=tmp_path / "share",
@@ -224,16 +228,20 @@ def test_approve_and_release_api_hook(tmp_path: Path) -> None:
         app.state.release_engine = engine
         app.state.repository_kind = "sqlite"
 
+        auth_headers, operator_id = operator_auth_headers(client, "operator_ada")
         first = client.patch(
             f"/api/documents/{job_a.id}",
             json={
                 "action": "approve",
                 "verified_payload": {"fields": {"x": "ok"}},
-                "verified_by": "clerk.ada",
             },
-            headers={**LOCAL_API_HEADERS, "X-Operator-Identity": "clerk.ada"},
+            headers={
+                **auth_headers,
+                "X-Operator-Identity": "spoofed-client-value",
+            },
         )
         assert first.status_code == 200, first.text
+        assert repository.get_job(job_a.id).metadata["verified_by"] == operator_id
         assert repository.get_batch(batch.id).status == BatchStatus.READY_FOR_HITL
 
         second = client.patch(
@@ -241,9 +249,8 @@ def test_approve_and_release_api_hook(tmp_path: Path) -> None:
             json={
                 "action": "approve",
                 "verified_payload": {"fields": {"x": "ok"}},
-                "verified_by": "clerk.ada",
             },
-            headers={**LOCAL_API_HEADERS, "X-Operator-Identity": "clerk.ada"},
+            headers=auth_headers,
         )
         assert second.status_code == 200, second.text
         assert repository.get_batch(batch.id).status == BatchStatus.RELEASED

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DocumentJobOut(BaseModel):
@@ -32,16 +32,10 @@ class QueueResponse(BaseModel):
 class DocumentPatchRequest(BaseModel):
     """HITL approve/reject body from the verification SPA."""
 
+    model_config = ConfigDict(extra="forbid")
+
     action: Literal["approve", "reject"]
     verified_payload: dict[str, Any] | None = None
-    verified_by: str | None = Field(
-        default=None,
-        description="Clerk / operator identity (LAN username, machine id, or email).",
-    )
-    actor: str | None = Field(
-        default=None,
-        description="Alias for verified_by; either body field or X-Operator-Identity header.",
-    )
     reject_reason: str | None = None
 
 

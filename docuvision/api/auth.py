@@ -16,9 +16,9 @@ from pathlib import Path
 
 from typing import Annotated
 
-from fastapi import HTTPException, Query, Request, Security
+from fastapi import HTTPException, Request, Security
 from fastapi.responses import JSONResponse
-from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import APIKeyHeader
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 from starlette.types import ASGIApp
@@ -26,10 +26,7 @@ from starlette.types import ASGIApp
 logger = logging.getLogger(__name__)
 
 API_KEY_HEADER = "X-API-Key"
-API_KEY_QUERY_PARAM = "api_key"
-_UNAUTHORIZED_DETAIL = (
-    "Unauthorized. Provide a valid X-API-Key header or Bearer token."
-)
+_UNAUTHORIZED_DETAIL = "Unauthorized. Provide a valid X-API-Key header."
 _UNAUTHORIZED = JSONResponse(
     status_code=401,
     content={"detail": _UNAUTHORIZED_DETAIL},
@@ -37,7 +34,6 @@ _UNAUTHORIZED = JSONResponse(
 
 # Declared for OpenAPI + Depends(); middleware is the global `/api` enforcer.
 api_key_header_scheme = APIKeyHeader(name=API_KEY_HEADER, auto_error=False)
-bearer_scheme = HTTPBearer(auto_error=False)
 
 _active_api_key: str | None = None
 
@@ -153,21 +149,14 @@ def reset_api_key_cache() -> None:
 
 
 def extract_presented_api_key(request: Request) -> str | None:
-    """Pull the key from ``X-API-Key``, ``Authorization: Bearer``, or ``?api_key=``."""
+    """Pull the desktop handshake only from ``X-API-Key``.
+
+    ``Authorization`` is reserved for the independently verified operator JWT.
+    Query-string credentials are rejected because URLs commonly leak into logs.
+    """
     header_key = request.headers.get(API_KEY_HEADER)
     if header_key is not None and header_key.strip():
         return header_key.strip()
-
-    authorization = request.headers.get("Authorization")
-    if authorization:
-        scheme, _, token = authorization.partition(" ")
-        if scheme.lower() == "bearer" and token.strip():
-            return token.strip()
-
-    query_key = request.query_params.get(API_KEY_QUERY_PARAM)
-    if query_key is not None and query_key.strip():
-        return query_key.strip()
-
     return None
 
 
@@ -179,22 +168,10 @@ def api_key_matches(presented: str | None, expected: str) -> bool:
 
 async def require_local_api_key(
     api_key: Annotated[str | None, Security(api_key_header_scheme)] = None,
-    credentials: Annotated[
-        HTTPAuthorizationCredentials | None,
-        Security(bearer_scheme),
-    ] = None,
-    api_key_query: Annotated[str | None, Query(alias=API_KEY_QUERY_PARAM)] = None,
 ) -> str:
-    """FastAPI dependency — accept ``X-API-Key``, Bearer, or ``?api_key=``."""
+    """FastAPI dependency for the desktop-to-loopback handshake."""
     expected = get_active_api_key()
-    presented: str | None = None
-    if api_key is not None and api_key.strip():
-        presented = api_key.strip()
-    elif credentials is not None and credentials.scheme.lower() == "bearer":
-        token = (credentials.credentials or "").strip()
-        presented = token or None
-    elif api_key_query is not None and api_key_query.strip():
-        presented = api_key_query.strip()
+    presented = api_key.strip() if api_key is not None and api_key.strip() else None
 
     if not api_key_matches(presented, expected):
         raise HTTPException(status_code=401, detail=_UNAUTHORIZED_DETAIL)

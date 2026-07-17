@@ -27,7 +27,7 @@
         "style-src": "'self' 'unsafe-inline'",
         "img-src": "'self' data: blob: http://127.0.0.1:* http://localhost:* http://192.168.*:* http://10.*:*",
         "font-src": "'self' data:",
-        "connect-src": "'self' http://127.0.0.1:* http://localhost:* http://192.168.*:* http://10.*:* ipc: http://ipc.localhost",
+        "connect-src": "'self' http://127.0.0.1:* http://localhost:* ipc: http://ipc.localhost",
         "object-src": "'none'",
         "base-uri": "'self'",
         "form-action": "'self'"

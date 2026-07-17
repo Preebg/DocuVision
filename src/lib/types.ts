@@ -95,8 +95,6 @@ export interface DocumentPipelineRow {
   processing_started_at?: string | null;
 }
 
-export const VERIFIED_BY = "Web_Operator_V1";
-export const OPERATOR_IDENTITY_STORAGE_KEY = "docuvision_operator_identity";
 export const DEFAULT_STORAGE_BUCKET = "verification_queue";
 export const INCOMING_STORAGE_BUCKET = "incoming_forms";
 
@@ -132,35 +130,6 @@ export function fieldKeysForPayload(
   return present.length > 0 ? present : VERIFICATION_FIELD_KEYS;
 }
 
-/**
- * Resolve the clerk / operator identity for non-repudiation on PATCH.
- * Priority: localStorage → NEXT_PUBLIC_OPERATOR_IDENTITY → VERIFIED_BY fallback.
- */
-export function getOperatorIdentity(): string {
-  if (typeof window !== "undefined") {
-    const stored = window.localStorage
-      .getItem(OPERATOR_IDENTITY_STORAGE_KEY)
-      ?.trim();
-    if (stored) {
-      return stored;
-    }
-  }
-  const fromEnv = process.env.NEXT_PUBLIC_OPERATOR_IDENTITY?.trim();
-  if (fromEnv) {
-    return fromEnv;
-  }
-  return VERIFIED_BY;
-}
-
-export function setOperatorIdentity(identity: string): void {
-  if (typeof window === "undefined") {
-    return;
-  }
-  const cleaned = identity.trim();
-  if (cleaned) {
-    window.localStorage.setItem(OPERATOR_IDENTITY_STORAGE_KEY, cleaned);
-  }
-}
 /** Statuses shown in the HITL review pane. */
 export const HITL_REVIEW_STATUSES: PipelineStatusType[] = [
   PipelineStatus.PENDING_VERIFICATION,

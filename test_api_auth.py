@@ -6,13 +6,15 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from conftest import LOCAL_API_HEADERS
+from conftest import LOCAL_API_HEADERS, operator_auth_headers
 from docuvision.api.auth import (
     reset_api_key_cache,
     resolve_and_persist_api_key,
     write_token_lock,
 )
 from docuvision.api.main import create_app
+from docuvision.api.operator_auth import reset_operator_auth_caches
+from docuvision.api.operator_auth import provision_operator
 from docuvision.config.settings import get_settings
 
 
@@ -31,10 +33,10 @@ def test_api_rejects_missing_key(tmp_path: Path, monkeypatch) -> None:
             "/api/health",
             headers={"Authorization": "Bearer gate-test-key"},
         )
-        assert bearer.status_code == 200
+        assert bearer.status_code == 401
 
 
-def test_api_accepts_query_param_for_file_stream(tmp_path: Path, monkeypatch) -> None:
+def test_api_rejects_query_string_credentials(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("LOCAL_API_KEY", "query-test-key")
     reset_api_key_cache()
     get_settings.cache_clear()
@@ -42,8 +44,105 @@ def test_api_accepts_query_param_for_file_stream(tmp_path: Path, monkeypatch) ->
     with TestClient(app) as client:
         denied = client.get("/api/health")
         assert denied.status_code == 401
-        allowed = client.get("/api/health?api_key=query-test-key")
-        assert allowed.status_code == 200
+        rejected = client.get("/api/health?api_key=query-test-key")
+        assert rejected.status_code == 401
+
+
+def test_sensitive_route_requires_valid_operator_jwt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("DOCUVISION_DATA_ROOT", str(tmp_path))
+    reset_api_key_cache()
+    get_settings.cache_clear()
+    reset_operator_auth_caches()
+    app = create_app()
+    with TestClient(app) as client:
+        missing = client.patch(
+            "/api/documents/missing",
+            json={"action": "approve"},
+            headers=LOCAL_API_HEADERS,
+        )
+        assert missing.status_code == 401
+
+        invalid = client.patch(
+            "/api/documents/missing",
+            json={"action": "approve"},
+            headers={
+                **LOCAL_API_HEADERS,
+                "Authorization": "Bearer invalid",
+                "X-Operator-Identity": "spoofed",
+            },
+        )
+        assert invalid.status_code == 401
+
+        auth_headers, _operator_id = operator_auth_headers(client)
+        valid = client.patch(
+            "/api/documents/missing",
+            json={"action": "approve"},
+            headers=auth_headers,
+        )
+        assert valid.status_code == 404
+
+
+def test_refresh_tokens_rotate_and_replay_revokes_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("DOCUVISION_DATA_ROOT", str(tmp_path))
+    reset_api_key_cache()
+    get_settings.cache_clear()
+    reset_operator_auth_caches()
+    provision_operator("rotation_test", "correct-horse-battery-staple")
+    app = create_app()
+    with TestClient(app) as client:
+        denied = client.post(
+            "/api/auth/login",
+            json={"username": "rotation_test", "password": "wrong-password-value"},
+            headers=LOCAL_API_HEADERS,
+        )
+        assert denied.status_code == 401
+
+        login = client.post(
+            "/api/auth/login",
+            json={
+                "username": "rotation_test",
+                "password": "correct-horse-battery-staple",
+            },
+            headers=LOCAL_API_HEADERS,
+        )
+        assert login.status_code == 200
+        original = login.json()
+        rotated = client.post(
+            "/api/auth/refresh",
+            json={
+                "session_id": original["session_id"],
+                "refresh_token": original["refresh_token"],
+            },
+            headers=LOCAL_API_HEADERS,
+        )
+        assert rotated.status_code == 200
+        assert rotated.json()["refresh_token"] != original["refresh_token"]
+
+        replay = client.post(
+            "/api/auth/refresh",
+            json={
+                "session_id": original["session_id"],
+                "refresh_token": original["refresh_token"],
+            },
+            headers=LOCAL_API_HEADERS,
+        )
+        assert replay.status_code == 401
+
+        revoked_access = client.patch(
+            "/api/documents/missing",
+            json={"action": "approve"},
+            headers={
+                **LOCAL_API_HEADERS,
+                "Authorization": f"Bearer {rotated.json()['access_token']}",
+            },
+        )
+        assert revoked_access.status_code == 401
 
 
 def test_session_token_written_to_lockfile(tmp_path: Path, monkeypatch) -> None:

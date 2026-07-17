@@ -7,13 +7,14 @@ Usage::
 Binds to ``127.0.0.1:8000`` by default (override with ``DOCUVISION_API_HOST`` /
 ``DOCUVISION_API_PORT``). Docker compose sets host to ``0.0.0.0``.
 
-Local handshake: every ``/api/...`` route requires ``X-API-Key`` (or
-``Authorization: Bearer``). When ``LOCAL_API_KEY`` is unset, a high-entropy
+Local handshake: every ``/api/...`` route requires ``X-API-Key``. Sensitive
+operator actions additionally require a verified ``Authorization: Bearer`` JWT.
+When ``LOCAL_API_KEY`` is unset, a high-entropy
 session token is minted and written to the per-user ``token.lock`` file for the
 Tauri shell to read.
 
 Composes ``docuvision.api`` routers (queue, documents/PDF stream, batch ingest,
-ingestion status) with HITL queue/detail/verify projections over the local
+ingestion status) with HITL queue/detail projections over the local
 SQLite database under ``DOCUVISION_DATA_ROOT`` (default: ``<repo>/data``).
 
 The live SQLite schema (see ``migrations/001_documents_pipeline_events.sql``)
@@ -43,8 +44,6 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
 import uvicorn
 
 _STATUS_TO_DB: dict[str, str] = {
@@ -54,7 +53,6 @@ _STATUS_TO_DB: dict[str, str] = {
 
 _META_LOCAL_PATH = "local_path"
 _META_PAYLOAD = "extracted_payload"
-_META_VERIFIED = "verified_payload"
 
 
 def _db_path() -> Path:
@@ -327,24 +325,6 @@ def _strip_route(app: FastAPI, path: str, methods: set[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Request / response models
-# ---------------------------------------------------------------------------
-
-
-class VerifyRequest(BaseModel):
-    corrected_data: dict[str, Any] = Field(
-        ...,
-        description="Clerk-corrected extraction payload to persist.",
-    )
-
-
-class VerifyResponse(BaseModel):
-    status: str = "success"
-    id: str
-    document_status: str
-
-
-# ---------------------------------------------------------------------------
 # FastAPI application — sole production entrypoint
 # ---------------------------------------------------------------------------
 
@@ -358,15 +338,6 @@ def create_hitl_app() -> FastAPI:
     settings.ensure_directories()
 
     app = create_app()
-
-    # Outermost CORS: allow React/Tauri hosts without origin blockages.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
     # Replace the supervisor-oriented pending summary with the HITL batch queue.
     _strip_route(app, "/api/batches/pending", {"GET"})
@@ -423,65 +394,6 @@ def create_hitl_app() -> FastAPI:
             return detail
         finally:
             connection.close()
-
-    @app.post("/api/documents/{doc_id}/verify", response_model=VerifyResponse)
-    def verify_document(doc_id: str, body: VerifyRequest) -> VerifyResponse:
-        """Persist clerk corrections and transition the document to APPROVED."""
-        approved_status = _resolve_db_status("APPROVED")
-        connection = get_connection()
-        try:
-            cursor = connection.execute(
-                """
-                SELECT id, filename, status, retry_count, metadata, created_at
-                FROM documents
-                WHERE id = ?
-                """,
-                (doc_id,),
-            )
-            row = cursor.fetchone()
-            if row is None:
-                raise HTTPException(status_code=404, detail="Document not found.")
-
-            metadata = _loads_json_object(row["metadata"])
-            corrected = body.corrected_data
-            # Persist corrected extraction for both pipeline keys used by HITL.
-            # corrected_data is a nested dict — serialize once via metadata JSON
-            # so value / normalized_bbox / confidence survive round-trips.
-            if not isinstance(corrected, dict):
-                raise HTTPException(
-                    status_code=400,
-                    detail="corrected_data must be a JSON object.",
-                )
-            metadata[_META_PAYLOAD] = corrected
-            metadata[_META_VERIFIED] = corrected
-
-            connection.execute(
-                """
-                UPDATE documents
-                SET metadata = ?, status = ?
-                WHERE id = ?
-                """,
-                (
-                    json.dumps(metadata, ensure_ascii=False),
-                    approved_status,
-                    doc_id,
-                ),
-            )
-            connection.commit()
-        finally:
-            connection.close()
-
-        # Final release: export corrected JSON, archive PDF, mark RELEASED.
-        # Run after the verify connection is closed to avoid Windows locks.
-        from release_manager import release_document
-
-        release_result = release_document(doc_id)
-
-        return VerifyResponse(
-            status="success",
-            id=doc_id,
-            document_status=release_result["status"],
-        )
 
     return app
 

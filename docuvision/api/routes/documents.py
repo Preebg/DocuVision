@@ -8,11 +8,12 @@ import re
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from docuvision.adapters.local_storage import PROCESSABLE_SUFFIXES, LocalStorageAdapter
 from docuvision.api.deps import get_release_engine, get_repository, get_storage
+from docuvision.api.operator_auth import OperatorPrincipal, require_operator
 from docuvision.api.schemas import DocumentJobOut, DocumentPatchRequest, IngestResponse
 from docuvision.api.serializers import job_to_out
 from docuvision.core.contracts import PipelineRepository
@@ -23,7 +24,6 @@ router = APIRouter(tags=["documents"])
 logger = logging.getLogger(__name__)
 
 _SAFE_NAME = re.compile(r"[^a-zA-Z0-9._-]+")
-_OPERATOR_HEADER = "X-Operator-Identity"
 
 
 def _sanitize_file_name(name: str) -> str:
@@ -36,27 +36,6 @@ def _sanitize_file_name(name: str) -> str:
             detail=f"Unsupported file type: {suffix or '(none)'}",
         )
     return cleaned
-
-
-def _resolve_operator_identity(
-    body: DocumentPatchRequest,
-    x_operator_identity: str | None,
-) -> str:
-    """Prefer header, then body.actor, then body.verified_by."""
-    for candidate in (
-        x_operator_identity,
-        body.actor,
-        body.verified_by,
-    ):
-        if candidate is not None and str(candidate).strip():
-            return str(candidate).strip()
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            "Operator identity is required. Pass X-Operator-Identity header "
-            "or verified_by / actor in the request body."
-        ),
-    )
 
 
 def _payload_fields(payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -163,7 +142,7 @@ async def patch_document(
     body: DocumentPatchRequest,
     repository: PipelineRepository = Depends(get_repository),
     release_engine: ReleaseEngine = Depends(get_release_engine),
-    x_operator_identity: str | None = Header(default=None, alias=_OPERATOR_HEADER),
+    operator: OperatorPrincipal = Depends(require_operator),
 ) -> DocumentJobOut:
     job = repository.get_job(job_id)
     if job is None:
@@ -178,7 +157,9 @@ async def patch_document(
             ),
         )
 
-    actor = _resolve_operator_identity(body, x_operator_identity)
+    # Immutable JWT ``sub`` is the authoritative audit actor. Client-supplied
+    # identity headers/body fields are neither accepted nor consulted.
+    actor = operator.id
     original_payload = job.extracted_payload
     meta = dict(job.metadata)
 
@@ -186,6 +167,10 @@ async def patch_document(
         verified_payload = body.verified_payload or original_payload
         meta["verified_payload"] = verified_payload
         meta["verified_by"] = actor
+        meta["verified_by_username"] = operator.username
+        if operator.display_name:
+            meta["verified_by_display_name"] = operator.display_name
+        meta["verified_session_id"] = operator.session_id
         meta.pop("reject_reason", None)
         updated = repository.update_status(
             job_id,
@@ -230,6 +215,10 @@ async def patch_document(
         verified_payload = body.verified_payload
         meta["reject_reason"] = reject_reason
         meta["verified_by"] = actor
+        meta["verified_by_username"] = operator.username
+        if operator.display_name:
+            meta["verified_by_display_name"] = operator.display_name
+        meta["verified_session_id"] = operator.session_id
         if verified_payload is not None:
             meta["verified_payload"] = verified_payload
         updated = repository.update_status(
