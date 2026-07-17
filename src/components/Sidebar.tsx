@@ -1,3 +1,7 @@
+"use client";
+
+import { usePathname } from "next/navigation";
+import Link from "next/link";
 import { ApiStatusIndicator } from "@/components/ApiStatusIndicator";
 
 function LogoMark() {
@@ -27,6 +31,14 @@ function LogoMark() {
 }
 
 export function Sidebar() {
+  const pathname = usePathname();
+  const navClass = (active: boolean) =>
+    `flex items-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium transition ${
+      active
+        ? "bg-surface-elevated text-foreground ring-1 ring-border"
+        : "text-muted hover:bg-surface-elevated/60 hover:text-foreground"
+    }`;
+
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-surface">
       <div className="flex items-center gap-3 border-b border-border px-5 py-5">
@@ -42,13 +54,20 @@ export function Sidebar() {
       </div>
 
       <nav className="flex flex-1 flex-col gap-1 px-3 py-4">
-        <a
+        <Link
           href="/"
-          className="flex items-center gap-2 rounded-lg bg-surface-elevated px-3 py-2.5 text-sm font-medium text-foreground ring-1 ring-border"
+          className={navClass(pathname === "/")}
         >
           <span className="text-accent">◆</span>
           Batch Workbench
-        </a>
+        </Link>
+        <Link
+          href="/ingestion"
+          className={navClass(pathname.startsWith("/ingestion"))}
+        >
+          <span className="font-mono text-success">▣</span>
+          Ingestion Telemetry
+        </Link>
         <p className="mt-4 px-3 text-[11px] uppercase tracking-wider text-muted">
           Station
         </p>
