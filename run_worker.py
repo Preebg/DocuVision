@@ -22,6 +22,12 @@ from docuvision.composition import build_backends
 from docuvision.config.settings import Settings, get_settings
 from docuvision.core.pipeline import DocumentPipeline
 from docuvision.registry.schema_registry import SchemaRegistry
+from docuvision.stages.gated_extraction import (
+    DeferredGatedLayoutStage,
+    GatedExtractionPipeline,
+    GatedPipelineConfig,
+    GatedVisionExtractionStage,
+)
 from docuvision.stages.layout import DoclingLayoutStage
 from docuvision.stages.vision_extraction import VisionExtractionStage
 
@@ -35,14 +41,22 @@ def build_pipeline(
 ) -> DocumentPipeline:
     """Wire concrete adapters into the Protocol-only orchestrator."""
     storage, repository = build_backends(settings)
-    layout = DoclingLayoutStage()
-    vision_client = ollama or OllamaVisionClient(settings)
-    registry = SchemaRegistry(settings.resolved_schemas_dir())
-    vision = VisionExtractionStage(
-        vision_client,
-        registry=registry,
-        use_llm_classification=settings.classification_use_llm,
-    )
+    if settings.extraction_backend == "gated":
+        logger.info("worker.extraction_backend=gated")
+        layout = DeferredGatedLayoutStage()
+        vision = GatedVisionExtractionStage(
+            GatedExtractionPipeline(GatedPipelineConfig.from_settings(settings))
+        )
+    else:
+        logger.info("worker.extraction_backend=legacy")
+        layout = DoclingLayoutStage()
+        vision_client = ollama or OllamaVisionClient(settings)
+        registry = SchemaRegistry(settings.resolved_schemas_dir())
+        vision = VisionExtractionStage(
+            vision_client,
+            registry=registry,
+            use_llm_classification=settings.classification_use_llm,
+        )
 
     return DocumentPipeline(
         storage=storage,
@@ -112,10 +126,13 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("ollama_base_url=%s", settings.ollama_base_url)
     logger.info("schemas_dir=%s", settings.resolved_schemas_dir())
     logger.info("classification_use_llm=%s", settings.classification_use_llm)
+    logger.info("extraction_backend=%s", settings.extraction_backend)
 
     settings.ensure_directories()
-    ollama = OllamaVisionClient(settings)
-    ollama.validate_access()
+    ollama: OllamaVisionClient | None = None
+    if settings.extraction_backend == "legacy":
+        ollama = OllamaVisionClient(settings)
+        ollama.validate_access()
 
     pipeline = build_pipeline(settings, ollama=ollama)
     try:

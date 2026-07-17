@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from tempfile import gettempdir
+from typing import Literal
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -157,6 +159,29 @@ class Settings(BaseSettings):
     ollama_pdf_max_pages: int = Field(default=5, ge=1)
 
     # -- layout / watcher / fault protection -----------------------------
+    extraction_backend: Literal["legacy", "gated"] = Field(
+        default="legacy",
+        description=(
+            "Extraction implementation. 'gated' uses isolated local Docling, "
+            "GLM-OCR, and quantized Qwen workers."
+        ),
+    )
+    gated_temp_root: Path = Field(
+        default_factory=lambda: Path(gettempdir()),
+        description="Session scratch root; resolves to /tmp on Linux.",
+    )
+    gated_layout_timeout_seconds: int = Field(default=900, ge=30)
+    gated_model_timeout_seconds: int = Field(default=900, ge=30)
+    gated_layout_rss_limit_mb: int = Field(default=4096, ge=256)
+    gated_glm_rss_limit_mb: int = Field(default=3072, ge=256)
+    gated_qwen_rss_limit_mb: int = Field(default=8192, ge=256)
+    gated_pdf_dpi: int = Field(default=150, ge=72, le=600)
+    gated_checkbox_density_threshold: float = Field(default=0.12, ge=0.0, le=1.0)
+    gated_glm_model: str = Field(default="zai-org/GLM-OCR")
+    gated_qwen_model: str = Field(default="Qwen/Qwen3-VL-8B-Instruct")
+    gated_qwen_quantization: Literal["4bit", "8bit", "none"] = Field(
+        default="4bit"
+    )
     layout_max_chars: int = Field(default=8000, ge=500)
     watcher_poll_interval_seconds: int = Field(default=3, ge=1)
     MAX_RETRIES: int = Field(
