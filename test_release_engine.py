@@ -79,7 +79,7 @@ async def test_fs_drop_exporter_writes_package_and_checksums(tmp_path: Path) -> 
     assert metadata["documents"][0]["verified_by"] == "clerk.jdoe"
 
     manifest = (package / "checksums.sha256").read_text(encoding="utf-8").strip().splitlines()
-    assert len(manifest) == 2  # pdf + metadata.json
+    assert len(manifest) == 4  # pdf + xml + sql + metadata.json
     for line in manifest:
         digest, _, relative = line.partition("  ")
         assert len(digest) == 64
@@ -153,6 +153,8 @@ async def test_release_engine_status_machine_success(tmp_path: Path) -> None:
     assert (package / "metadata.json").is_file()
     assert (package / "checksums.sha256").is_file()
     assert list(package.glob("*.pdf"))
+    assert list(package.glob("*.xml"))
+    assert list(package.glob("*.sql"))
 
 
 @pytest.mark.asyncio
@@ -257,5 +259,7 @@ def test_approve_and_release_api_hook(tmp_path: Path, monkeypatch) -> None:
         package = tmp_path / "share" / f"API_Batch_{batch.id}"
         assert (package / "checksums.sha256").is_file()
         assert len(list(package.glob("*.pdf"))) == 2
+        assert len(list(package.glob("*.xml"))) == 2
+        assert len(list(package.glob("*.sql"))) == 2
     finally:
         client.__exit__(None, None, None)

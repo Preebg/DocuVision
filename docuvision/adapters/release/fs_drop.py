@@ -5,7 +5,8 @@ deterministic package per batch::
 
     {RELEASE_DIR}/{batch_name}_{batch_id}/
         01_doc.pdf
-        02_doc.pdf
+        01_doc.xml
+        01_doc.sql
         metadata.json
         checksums.sha256
 """
@@ -19,11 +20,13 @@ import logging
 import os
 import re
 import shutil
+from uuid import uuid4
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from docuvision.adapters.release.base import ReleaseExporter
+from docuvision.adapters.release.egress import EgressManager
 from docuvision.core.errors import ReleaseExportError
 
 logger = logging.getLogger(__name__)
@@ -39,9 +42,15 @@ class FSDropExporter(ReleaseExporter):
     become ``ReleaseExportError`` so orchestrators can mark ``release_failed``.
     """
 
-    def __init__(self, release_dir: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        release_dir: Path | str | None = None,
+        *,
+        egress_manager: EgressManager | None = None,
+    ) -> None:
         resolved = self._resolve_release_root(release_dir)
         self._release_dir = resolved
+        self._egress = egress_manager or EgressManager()
         try:
             self._release_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -78,14 +87,14 @@ class FSDropExporter(ReleaseExporter):
             )
 
         package_dir = self._package_dir(batch_name, batch_id)
-        # Fresh package on every attempt (retry-safe).
-        if package_dir.exists():
-            shutil.rmtree(package_dir)
+        staging_dir = self._release_dir / (
+            f".{package_dir.name}.{uuid4().hex}.staging"
+        )
         try:
-            package_dir.mkdir(parents=True, exist_ok=False)
+            staging_dir.mkdir(parents=True, exist_ok=False)
         except OSError as exc:
             raise ReleaseExportError(
-                f"Cannot create package directory '{package_dir}': {exc}"
+                f"Cannot create release staging directory '{staging_dir}': {exc}"
             ) from exc
 
         written_files: list[Path] = []
@@ -97,15 +106,23 @@ class FSDropExporter(ReleaseExporter):
                         f"Invalid document entry at index {index} for batch {batch_id}."
                     )
                 pdf_path = self._write_document_pdf(
-                    package_dir, index, document, batch_id=batch_id
+                    staging_dir, index, document, batch_id=batch_id
                 )
                 written_files.append(pdf_path)
+                xml_bytes, sql_text = self._egress.serialize(document)
+                xml_path = pdf_path.with_suffix(".xml")
+                sql_path = pdf_path.with_suffix(".sql")
+                xml_path.write_bytes(xml_bytes)
+                sql_path.write_text(sql_text, encoding="utf-8", newline="\n")
+                written_files.extend((xml_path, sql_path))
                 export_rows.append(
                     {
                         "document_id": document.get("document_id"),
                         "sequence_no": document.get("sequence_no", index),
                         "file_name": document.get("file_name"),
                         "exported_pdf": pdf_path.name,
+                        "exported_xml": xml_path.name,
+                        "exported_sql": sql_path.name,
                         "extracted_payload": document.get("extracted_payload"),
                         "verified_payload": document.get("verified_payload"),
                         "verified_by": document.get("verified_by"),
@@ -122,7 +139,7 @@ class FSDropExporter(ReleaseExporter):
                 "document_count": len(export_rows),
                 "documents": export_rows,
             }
-            metadata_path = package_dir / "metadata.json"
+            metadata_path = staging_dir / "metadata.json"
             metadata_path.write_text(
                 json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True)
                 + "\n",
@@ -130,13 +147,15 @@ class FSDropExporter(ReleaseExporter):
             )
             written_files.append(metadata_path)
 
-            checksum_path = package_dir / "checksums.sha256"
+            checksum_path = staging_dir / "checksums.sha256"
             checksum_path.write_text(
-                self._build_checksum_manifest(written_files, package_dir),
+                self._build_checksum_manifest(written_files, staging_dir),
                 encoding="utf-8",
+                newline="\n",
             )
-            # Integrity seal (checksums of PDFs + metadata only) — not listed
-            # inside itself to keep the manifest stable for auditors.
+            # Integrity seal for every document artifact plus package metadata.
+            # The manifest is not listed inside itself, keeping it stable.
+            self._publish_staged_package(staging_dir, package_dir)
 
             logger.info(
                 "release.fs_drop.success batch_id=%s package=%s files=%s",
@@ -146,9 +165,9 @@ class FSDropExporter(ReleaseExporter):
             )
             return True
         except Exception:
-            # Never leave a half-written package on the auditor share.
-            if package_dir.exists():
-                shutil.rmtree(package_dir, ignore_errors=True)
+            # The final package is untouched until every artifact is complete.
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
             raise
 
     def _write_document_pdf(
@@ -236,6 +255,32 @@ class FSDropExporter(ReleaseExporter):
         safe_name = _SAFE_COMPONENT.sub("_", batch_name).strip("._") or "batch"
         safe_id = _SAFE_COMPONENT.sub("_", batch_id).strip("._") or "unknown"
         return self._release_dir / f"{safe_name}_{safe_id}"
+
+    @staticmethod
+    def _publish_staged_package(staging_dir: Path, package_dir: Path) -> None:
+        """Atomically publish a complete package, preserving the old one on error."""
+        backup_dir = package_dir.with_name(
+            f".{package_dir.name}.{uuid4().hex}.backup"
+        )
+        moved_existing = False
+        try:
+            if package_dir.exists():
+                package_dir.replace(backup_dir)
+                moved_existing = True
+            staging_dir.replace(package_dir)
+        except OSError as exc:
+            if moved_existing and backup_dir.exists() and not package_dir.exists():
+                backup_dir.replace(package_dir)
+            raise ReleaseExportError(
+                f"Cannot publish release package '{package_dir}': {exc}"
+            ) from exc
+        if backup_dir.exists():
+            try:
+                shutil.rmtree(backup_dir)
+            except OSError:
+                logger.warning(
+                    "release.fs_drop.backup_cleanup_failed path=%s", backup_dir
+                )
 
     @staticmethod
     def _resolve_release_root(release_dir: Path | str | None) -> Path:

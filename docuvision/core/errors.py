@@ -38,3 +38,21 @@ class ReleaseExportError(InfrastructureError):
     Catchable by the release orchestrator so the worker/API loop stays up and
     the batch transitions to ``release_failed`` for automated retry.
     """
+
+
+class ReleaseSerializationError(ReleaseExportError):
+    """A specific document could not be serialized for release."""
+
+    def __init__(
+        self,
+        serializer: str,
+        document_id: str,
+        detail: str,
+    ) -> None:
+        self.serializer = serializer
+        self.document_id = document_id
+        self.detail = detail
+        super().__init__(
+            f"{serializer.upper()} serialization failed for document "
+            f"{document_id}: {detail}"
+        )

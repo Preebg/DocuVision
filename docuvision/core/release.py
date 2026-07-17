@@ -272,6 +272,8 @@ class ReleaseEngine:
                     "extracted_payload": job.extracted_payload,
                     "verified_payload": verified_payload,
                     "verified_by": job.metadata.get("verified_by"),
+                    "status": job.status.value,
+                    "timestamp": job.updated_at.isoformat(),
                     "fields": fields,
                 }
             )
