@@ -38,6 +38,7 @@ class LocalStorageAdapter:
         self._verification = settings.resolved_verification_dir()
         self._processed = settings.resolved_processed_dir()
         self._failed = settings.resolved_failed_dir()
+        self._quarantine = settings.resolved_pipeline_quarantine_dir()
         self._release = settings.resolved_release_dir()
         self.ensure_directories()
 
@@ -48,6 +49,7 @@ class LocalStorageAdapter:
             self._verification,
             self._processed,
             self._failed,
+            self._quarantine,
             self._release,
         ):
             path.mkdir(parents=True, exist_ok=True)
@@ -98,6 +100,95 @@ class LocalStorageAdapter:
             ingress = self._safe_join(self._incoming, file_name)
             source = ingress if ingress.is_file() else source
         self._archive(file_name, str(source) if source.is_file() else None, self._failed, label="failed")
+
+    def quarantine_payload(
+        self,
+        document_id: str,
+        file_name: str,
+        local_path: str | None,
+    ) -> str:
+        """Move one document beneath its opaque quarantine namespace."""
+        safe_id = "".join(ch for ch in document_id if ch.isalnum() or ch in "-_")
+        if not safe_id or safe_id != document_id:
+            raise ValueError("Invalid document id for quarantine storage.")
+        item_dir = (self._quarantine / safe_id).resolve()
+        if not item_dir.is_relative_to(self._quarantine.resolve()):
+            raise ValueError("Refusing quarantine path outside configured root.")
+        item_dir.mkdir(parents=True, exist_ok=True)
+        destination = item_dir / Path(file_name).name
+        ingress = self._safe_join(self._incoming, file_name)
+        workspace = Path(local_path).resolve() if local_path else None
+        if workspace is not None and not workspace.is_relative_to(self._workspace.resolve()):
+            workspace = None
+
+        if destination.is_file():
+            if ingress.is_file():
+                ingress.unlink()
+            if workspace is not None and workspace.is_file():
+                workspace.unlink()
+        elif ingress.is_file():
+            shutil.move(str(ingress), destination)
+            if workspace is not None and workspace.is_file():
+                workspace.unlink()
+        elif workspace is not None and workspace.is_file():
+            shutil.move(str(workspace), destination)
+        else:
+            for root in (self._failed, self._verification, self._processed):
+                candidate = self._safe_join(root, file_name)
+                if candidate.is_file():
+                    shutil.move(str(candidate), destination)
+                    break
+            else:
+                raise FileNotFoundError(f"No payload found to quarantine: {file_name}")
+
+        locator = destination.relative_to(self._quarantine).as_posix()
+        logger.info(
+            "storage.quarantine document_id=%s file_name=%s",
+            document_id,
+            file_name,
+        )
+        return locator
+
+    def restore_for_redrive(
+        self,
+        file_name: str,
+        payload_locator: str | None,
+    ) -> str:
+        """Restore from quarantine or legacy failed storage without overwrite."""
+        destination = self._safe_join(self._incoming, file_name)
+        source: Path | None = None
+        if payload_locator:
+            candidate = (self._quarantine / payload_locator).resolve()
+            if not candidate.is_relative_to(self._quarantine.resolve()):
+                raise ValueError("Refusing quarantine locator outside configured root.")
+            if candidate.is_file():
+                source = candidate
+            elif destination.is_file():
+                # The known quarantine source has already been moved.
+                return destination.name
+            else:
+                raise FileNotFoundError(
+                    f"Quarantine payload is missing: {file_name}"
+                )
+        else:
+            for root in (self._failed, self._verification, self._processed):
+                candidate = self._safe_join(root, file_name)
+                if candidate.is_file():
+                    source = candidate
+                    break
+
+        if destination.is_file():
+            if source is not None:
+                raise FileExistsError(
+                    f"Incoming redrive destination already exists: {file_name}"
+                )
+            # Source is gone: a prior interrupted redrive already moved it.
+            return destination.name
+        if source is None:
+            raise FileNotFoundError(f"No redrive payload found: {file_name}")
+        shutil.move(str(source), destination)
+        logger.info("storage.redrive restored file_name=%s", file_name)
+        return destination.name
 
     def write_incoming(self, file_name: str, source: BinaryIO | bytes) -> str:
         """Write an uploaded document into the ingress directory.

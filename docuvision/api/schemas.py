@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class DocumentJobOut(BaseModel):
@@ -109,3 +109,57 @@ class IngestionStatusResponse(BaseModel):
     stale: bool = True
     total_queue_depth: int = 0
     sources: list[IngestionSourceStatusOut] = Field(default_factory=list)
+
+
+class QuarantineItemOut(BaseModel):
+    id: str
+    document_id: str
+    file_name: str
+    document_status: str
+    lifecycle_status: str
+    quarantine_reason: str
+    error_stack: str | None = None
+    failed_stage: str | None = None
+    retry_count: int
+    quarantined_at: str
+    redrive_started_at: str | None = None
+    batch_ids: list[str] = Field(default_factory=list)
+
+
+class QuarantineItemsResponse(BaseModel):
+    items: list[QuarantineItemOut] = Field(default_factory=list)
+    total: int
+    limit: int
+    offset: int
+
+
+class QuarantineRedriveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_ids: list[str] | None = Field(default=None, min_length=1, max_length=100)
+    batch_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_target(self) -> "QuarantineRedriveRequest":
+        if (self.document_ids is None) == (self.batch_id is None):
+            raise ValueError("Provide exactly one of document_ids or batch_id.")
+        if self.document_ids is not None:
+            cleaned = [item.strip() for item in self.document_ids]
+            if any(not item or len(item) > 128 for item in cleaned):
+                raise ValueError("Document IDs must be 1-128 characters.")
+            if len(set(cleaned)) != len(cleaned):
+                raise ValueError("document_ids must not contain duplicates.")
+            self.document_ids = cleaned
+        return self
+
+
+class RedriveItemOut(BaseModel):
+    document_id: str
+    outcome: str
+    status: str | None = None
+    retry_count: int | None = None
+    detail: str | None = None
+
+
+class QuarantineRedriveResponse(BaseModel):
+    results: list[RedriveItemOut] = Field(default_factory=list)

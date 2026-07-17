@@ -605,6 +605,18 @@ def require_operator(
     return principal
 
 
+def require_supervisor_or_admin(
+    operator: Annotated[OperatorPrincipal, Depends(require_operator)],
+) -> OperatorPrincipal:
+    """Authorize control-center operations without trusting JWT claims alone."""
+    if operator.role not in {"supervisor", "admin"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Supervisor or administrator role required.",
+        )
+    return operator
+
+
 def reset_operator_auth_caches() -> None:
     """Test helper for isolated signing-key/settings environments."""
     _signing_key.cache_clear()

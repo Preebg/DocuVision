@@ -125,6 +125,59 @@ class DocumentJob(BaseModel):
         return self.model_copy(update=updates)
 
 
+class DocumentLifecycleStatus(str, Enum):
+    """Stable coarse states exposed to control-center clients."""
+
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    QUARANTINED = "QUARANTINED"
+
+
+class QuarantineReason(str, Enum):
+    PARSING_ERROR = "PARSING_ERROR"
+    VRAM_OOM = "VRAM_OOM"
+    VALIDATION_FAILED = "VALIDATION_FAILED"
+    NETWORK_TIMEOUT = "NETWORK_TIMEOUT"
+    RETRY_EXHAUSTED = "RETRY_EXHAUSTED"
+    INFRASTRUCTURE_ERROR = "INFRASTRUCTURE_ERROR"
+    PROCESSING_ERROR = "PROCESSING_ERROR"
+
+
+def lifecycle_status(status: PipelineStatus) -> DocumentLifecycleStatus:
+    """Map detailed worker stages to the public five-state lifecycle."""
+    if status == PipelineStatus.QUEUED:
+        return DocumentLifecycleStatus.PENDING
+    if status == PipelineStatus.QUARANTINED:
+        return DocumentLifecycleStatus.QUARANTINED
+    if status == PipelineStatus.FAILED:
+        return DocumentLifecycleStatus.FAILED
+    if status == PipelineStatus.VERIFIED:
+        return DocumentLifecycleStatus.COMPLETED
+    return DocumentLifecycleStatus.PROCESSING
+
+
+class QuarantineItem(BaseModel):
+    """One durable quarantine attempt joined to its document."""
+
+    id: str
+    document_id: str
+    file_name: str
+    document_status: PipelineStatus
+    lifecycle_status: DocumentLifecycleStatus
+    reason: QuarantineReason
+    error_stack: str | None = None
+    failed_stage: str | None = None
+    payload_locator: str | None = None
+    retry_count: int = 0
+    quarantined_at: datetime
+    redrive_started_at: datetime | None = None
+    redriven_at: datetime | None = None
+    redriven_by: str | None = None
+    batch_ids: list[str] = Field(default_factory=list)
+
+
 class PipelineResult(BaseModel):
     """Outcome of a single document run through the state machine."""
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 from uuid import uuid4
@@ -27,6 +27,9 @@ from docuvision.core.models import (
     DocumentJob,
     DocumentPage,
     PipelineStatus,
+    QuarantineItem,
+    QuarantineReason,
+    lifecycle_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -618,6 +621,322 @@ class SqlitePipelineRepository:
             ).fetchall()
         return [self._row_to_job(row) for row in rows]
 
+    def begin_quarantine(
+        self,
+        job_id: str,
+        *,
+        reason: QuarantineReason,
+        error_stack: str,
+        failed_stage: str,
+    ) -> QuarantineItem:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT qa.*, d.filename, d.status AS document_status,
+                       d.retry_count AS document_retry_count
+                FROM quarantine_attempts qa
+                JOIN documents d ON d.id = qa.document_id
+                WHERE qa.document_id = ? AND qa.redriven_at IS NULL
+                """,
+                (job_id,),
+            ).fetchone()
+            if existing is not None:
+                connection.commit()
+                return self._row_to_quarantine_item(connection, existing)
+            row = connection.execute(
+                "SELECT * FROM documents WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Job not found: {job_id}")
+            job = self._row_to_job(row)
+            from_status = job.status.value
+            now = _utc_iso()
+            attempt_id = str(uuid4())
+            metadata = {
+                **job.metadata,
+                "quarantine_reason": reason.value,
+                "quarantined_at": now,
+                "failed_stage": failed_stage,
+            }
+            quarantined = job.model_copy(
+                update={
+                    "status": PipelineStatus.QUARANTINED,
+                    "error_message": str(error_stack).splitlines()[-1][:2000],
+                    "metadata": metadata,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            connection.execute(
+                "UPDATE documents SET status = ?, metadata = ? WHERE id = ?",
+                (
+                    PipelineStatus.QUARANTINED.value,
+                    self._dumps(self._pack_metadata(quarantined)),
+                    job_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO quarantine_attempts (
+                    id, document_id, reason, error_stack, failed_stage,
+                    retry_count, quarantined_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    job_id,
+                    reason.value,
+                    error_stack,
+                    failed_stage,
+                    job.retry_count,
+                    now,
+                ),
+            )
+            self._insert_event(
+                connection,
+                job_id=job_id,
+                action="DOCUMENT_QUARANTINED",
+                from_status=from_status,
+                to_status=PipelineStatus.QUARANTINED.value,
+                details={
+                    "attempt_id": attempt_id,
+                    "reason": reason.value,
+                    "failed_stage": failed_stage,
+                    "retry_count": job.retry_count,
+                },
+            )
+            result = connection.execute(
+                """
+                SELECT qa.*, d.filename, d.status AS document_status,
+                       d.retry_count AS document_retry_count
+                FROM quarantine_attempts qa
+                JOIN documents d ON d.id = qa.document_id
+                WHERE qa.id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            connection.commit()
+            return self._row_to_quarantine_item(connection, result)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def set_quarantine_locator(self, attempt_id: str, locator: str) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE quarantine_attempts SET payload_locator = ?
+                WHERE id = ? AND redriven_at IS NULL
+                """,
+                (locator, attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Active quarantine attempt not found: {attempt_id}")
+
+    def get_active_quarantine(self, document_id: str) -> QuarantineItem | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT qa.*, d.filename, d.status AS document_status,
+                       d.retry_count AS document_retry_count
+                FROM quarantine_attempts qa
+                JOIN documents d ON d.id = qa.document_id
+                WHERE qa.document_id = ? AND qa.redriven_at IS NULL
+                """,
+                (document_id,),
+            ).fetchone()
+            return self._row_to_quarantine_item(connection, row) if row else None
+
+    def list_quarantine_items(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        reason: QuarantineReason | None = None,
+    ) -> tuple[list[QuarantineItem], int]:
+        where = "qa.redriven_at IS NULL"
+        params: list[Any] = []
+        if reason is not None:
+            where += " AND qa.reason = ?"
+            params.append(reason.value)
+        with self._connect() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM quarantine_attempts qa WHERE {where}",
+                    params,
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                f"""
+                SELECT qa.*, d.filename, d.status AS document_status,
+                       d.retry_count AS document_retry_count
+                FROM quarantine_attempts qa
+                JOIN documents d ON d.id = qa.document_id
+                WHERE {where}
+                ORDER BY qa.quarantined_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, limit, offset],
+            ).fetchall()
+            items = [self._row_to_quarantine_item(connection, row) for row in rows]
+        return items, total
+
+    def reserve_redrive(
+        self,
+        document_id: str,
+        *,
+        actor: str,
+        token: str,
+    ) -> QuarantineItem | None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            now = _utc_iso()
+            stale_before = (
+                datetime.now(timezone.utc) - timedelta(minutes=5)
+            ).isoformat()
+            cursor = connection.execute(
+                """
+                UPDATE quarantine_attempts
+                SET redrive_token = ?, redrive_started_at = ?
+                WHERE document_id = ? AND redriven_at IS NULL
+                  AND (
+                      redrive_token IS NULL OR redrive_token = ?
+                      OR redrive_started_at < ?
+                  )
+                """,
+                (token, now, document_id, token, stale_before),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return None
+            row = connection.execute(
+                """
+                SELECT qa.*, d.filename, d.status AS document_status,
+                       d.retry_count AS document_retry_count
+                FROM quarantine_attempts qa
+                JOIN documents d ON d.id = qa.document_id
+                WHERE qa.document_id = ? AND qa.redriven_at IS NULL
+                """,
+                (document_id,),
+            ).fetchone()
+            item = self._row_to_quarantine_item(connection, row)
+            if item.document_status not in {
+                PipelineStatus.QUARANTINED,
+                PipelineStatus.FAILED,
+            }:
+                connection.rollback()
+                return None
+            connection.commit()
+            return item
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finalize_redrive(
+        self,
+        document_id: str,
+        *,
+        actor: str,
+        token: str,
+    ) -> DocumentJob:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM documents WHERE id = ?",
+                (document_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Job not found: {document_id}")
+            job = self._row_to_job(row)
+            if job.status not in {PipelineStatus.QUARANTINED, PipelineStatus.FAILED}:
+                raise ValueError(f"Job is not redrive eligible: {job.status.value}")
+            attempt = connection.execute(
+                """
+                SELECT id FROM quarantine_attempts
+                WHERE document_id = ? AND redriven_at IS NULL AND redrive_token = ?
+                """,
+                (document_id, token),
+            ).fetchone()
+            if attempt is None:
+                raise ValueError("Redrive reservation is missing or stale.")
+            now = _utc_iso()
+            metadata = {
+                key: value
+                for key, value in job.metadata.items()
+                if key not in {
+                    "quarantine_reason",
+                    "quarantined_at",
+                    "failed_stage",
+                    "error_traceback",
+                    "last_transient_traceback",
+                    "validation_failures",
+                    "dead_letter",
+                }
+            }
+            queued = job.model_copy(
+                update={
+                    "status": PipelineStatus.QUEUED,
+                    "retry_count": job.retry_count + 1,
+                    "metadata": metadata,
+                    "local_path": None,
+                    "layout_markdown": None,
+                    "extracted_payload": None,
+                    "error_message": None,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            cursor = connection.execute(
+                """
+                UPDATE documents SET status = ?, retry_count = ?, metadata = ?
+                WHERE id = ? AND status IN (?, ?)
+                """,
+                (
+                    PipelineStatus.QUEUED.value,
+                    queued.retry_count,
+                    self._dumps(self._pack_metadata(queued)),
+                    document_id,
+                    PipelineStatus.QUARANTINED.value,
+                    PipelineStatus.FAILED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Document state changed during redrive.")
+            connection.execute(
+                """
+                UPDATE quarantine_attempts
+                SET redriven_at = ?, redriven_by = ?
+                WHERE id = ? AND redrive_token = ?
+                """,
+                (now, actor, attempt["id"], token),
+            )
+            self._insert_event(
+                connection,
+                job_id=document_id,
+                action="DOCUMENT_REDRIVEN",
+                from_status=job.status.value,
+                to_status=PipelineStatus.QUEUED.value,
+                details={
+                    "attempt_id": attempt["id"],
+                    "retry_count": queued.retry_count,
+                },
+                actor=actor,
+            )
+            connection.commit()
+            return queued
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def emit_audit_event(
         self,
         *,
@@ -729,6 +1048,36 @@ class SqlitePipelineRepository:
             updated_at=_parse_dt(updated_raw)
             if isinstance(updated_raw, str)
             else _parse_dt(row["created_at"]),
+        )
+
+    def _row_to_quarantine_item(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> QuarantineItem:
+        batch_rows = connection.execute(
+            "SELECT batch_id FROM batch_documents WHERE document_id = ? ORDER BY batch_id",
+            (row["document_id"],),
+        ).fetchall()
+        status = PipelineStatus(row["document_status"])
+        return QuarantineItem(
+            id=row["id"],
+            document_id=row["document_id"],
+            file_name=row["filename"],
+            document_status=status,
+            lifecycle_status=lifecycle_status(status),
+            reason=QuarantineReason(row["reason"]),
+            error_stack=row["error_stack"],
+            failed_stage=row["failed_stage"],
+            payload_locator=row["payload_locator"],
+            retry_count=int(row["document_retry_count"] or 0),
+            quarantined_at=_parse_dt(row["quarantined_at"]),
+            redrive_started_at=_parse_dt(row["redrive_started_at"])
+            if row["redrive_started_at"]
+            else None,
+            redriven_at=_parse_dt(row["redriven_at"]) if row["redriven_at"] else None,
+            redriven_by=row["redriven_by"],
+            batch_ids=[item["batch_id"] for item in batch_rows],
         )
 
     @staticmethod

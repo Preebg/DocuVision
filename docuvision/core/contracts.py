@@ -16,6 +16,8 @@ from docuvision.core.models import (
     DocumentJob,
     DocumentPage,
     PipelineStatus,
+    QuarantineItem,
+    QuarantineReason,
 )
 
 
@@ -50,6 +52,23 @@ class StorageBackend(Protocol):
 
     def mark_failed(self, file_name: str, local_path: str | None) -> None:
         """Move a failed document into the dead-letter / failed area."""
+        ...
+
+    def quarantine_payload(
+        self,
+        document_id: str,
+        file_name: str,
+        local_path: str | None,
+    ) -> str:
+        """Isolate a payload and return an opaque, non-client-facing locator."""
+        ...
+
+    def restore_for_redrive(
+        self,
+        file_name: str,
+        payload_locator: str | None,
+    ) -> str:
+        """Idempotently restore a quarantined/failed payload to ingress."""
         ...
 
     def write_incoming_batch(
@@ -160,6 +179,13 @@ class PipelineRepository(Protocol):
         """Load a job by id, or ``None`` if missing."""
         ...
 
+    def list_by_statuses(
+        self,
+        statuses: Sequence[PipelineStatus],
+    ) -> list[DocumentJob]:
+        """List jobs whose detailed state is in ``statuses``."""
+        ...
+
     def claim_next_queued(self) -> DocumentJob | None:
         """Atomically claim the next ``QUEUED`` job for extraction.
 
@@ -171,6 +197,55 @@ class PipelineRepository(Protocol):
         compare-and-set update. Returns the claimed job already transitioned
         to ``SCANNING``, or ``None`` when the queue is empty.
         """
+        ...
+
+    def begin_quarantine(
+        self,
+        job_id: str,
+        *,
+        reason: QuarantineReason,
+        error_stack: str,
+        failed_stage: str,
+    ) -> QuarantineItem:
+        """Atomically mark a document quarantined and create its active attempt."""
+        ...
+
+    def set_quarantine_locator(self, attempt_id: str, locator: str) -> None:
+        """Attach the opaque storage locator after payload isolation."""
+        ...
+
+    def get_active_quarantine(self, document_id: str) -> QuarantineItem | None:
+        """Return the unresolved quarantine attempt for a document."""
+        ...
+
+    def list_quarantine_items(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        reason: QuarantineReason | None = None,
+    ) -> tuple[list[QuarantineItem], int]:
+        """Page unresolved quarantine attempts newest first."""
+        ...
+
+    def reserve_redrive(
+        self,
+        document_id: str,
+        *,
+        actor: str,
+        token: str,
+    ) -> QuarantineItem | None:
+        """CAS-reserve one active item; return None on conflict/ineligible state."""
+        ...
+
+    def finalize_redrive(
+        self,
+        document_id: str,
+        *,
+        actor: str,
+        token: str,
+    ) -> DocumentJob:
+        """Atomically resolve the attempt and queue a clean, incremented job."""
         ...
 
     def emit_audit_event(

@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from docuvision.adapters.postgres_repository import PostgresPipelineRepository
 from docuvision.api.auth import install_api_auth
 from docuvision.api import operator_auth
-from docuvision.api.routes import batches, documents, ingestion, queue
+from docuvision.api.routes import batches, documents, ingestion, quarantine, queue
 from docuvision.api.schemas import HealthResponse
 from docuvision.composition import build_backends, build_release_engine, build_release_exporter
 from docuvision.config.settings import get_settings
@@ -81,6 +81,7 @@ def create_app() -> FastAPI:
     app.include_router(documents.router)
     app.include_router(batches.router)
     app.include_router(ingestion.router)
+    app.include_router(quarantine.router)
 
     @app.get("/api/health", response_model=HealthResponse)
     def health() -> HealthResponse:

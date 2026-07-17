@@ -14,6 +14,7 @@ class _FakeStorage:
     def __init__(self) -> None:
         self.incoming = ["form.pdf"]
         self.failed: list[tuple[str, str | None]] = []
+        self.quarantined: list[tuple[str, str, str | None]] = []
         self.processed: list[tuple[str, str]] = []
 
     def list_incoming(self) -> list[str]:
@@ -30,6 +31,17 @@ class _FakeStorage:
 
     def mark_failed(self, file_name: str, local_path: str | None) -> None:
         self.failed.append((file_name, local_path))
+
+    def quarantine_payload(
+        self, document_id: str, file_name: str, local_path: str | None
+    ) -> str:
+        self.quarantined.append((document_id, file_name, local_path))
+        return f"{document_id}/{file_name}"
+
+    def restore_for_redrive(
+        self, file_name: str, payload_locator: str | None
+    ) -> str:
+        return file_name
 
 
 class _FakeLayout:
@@ -139,12 +151,12 @@ def test_validation_error_fails_without_retry(tmp_path):
     result = pipeline.process("form.pdf")
 
     assert result.success is False
-    assert result.status == PipelineStatus.FAILED
+    assert result.status == PipelineStatus.QUARANTINED
     job = repo.get_job(result.job_id)
     assert job is not None
     assert job.retry_count == 0
-    assert job.metadata.get("validation_failures") == ["corrupt PDF"]
-    assert storage.failed
+    assert job.metadata.get("quarantine_reason") == "PARSING_ERROR"
+    assert storage.quarantined
 
 
 def test_fatal_processing_error_fails_without_retry(tmp_path):
@@ -153,11 +165,11 @@ def test_fatal_processing_error_fails_without_retry(tmp_path):
     result = pipeline.process("form.pdf")
 
     assert result.success is False
-    assert result.status == PipelineStatus.FAILED
+    assert result.status == PipelineStatus.QUARANTINED
     job = repo.get_job(result.job_id)
     assert job is not None
-    assert "model crashed" in (job.metadata.get("validation_failures") or [""])[0]
-    assert storage.failed
+    assert job.metadata.get("quarantine_reason") == "PROCESSING_ERROR"
+    assert storage.quarantined
 
 
 def test_dead_letter_when_retry_count_at_ceiling(tmp_path):
@@ -168,11 +180,11 @@ def test_dead_letter_when_retry_count_at_ceiling(tmp_path):
     result = pipeline.process("form.pdf")
 
     assert result.success is False
-    assert result.status == PipelineStatus.FAILED
+    assert result.status == PipelineStatus.QUARANTINED
     failed = repo.get_job(result.job_id)
     assert failed is not None
     assert failed.metadata.get("dead_letter") is True
-    assert storage.failed
+    assert storage.quarantined
 
 
 def test_transient_at_max_retries_dead_letters(tmp_path):
@@ -184,9 +196,9 @@ def test_transient_at_max_retries_dead_letters(tmp_path):
 
     result = pipeline.process("form.pdf")
 
-    assert result.status == PipelineStatus.FAILED
+    assert result.status == PipelineStatus.QUARANTINED
     failed = repo.get_job(result.job_id)
     assert failed is not None
     assert failed.metadata.get("dead_letter") is True
     assert failed.retry_count == 1
-    assert storage.failed
+    assert storage.quarantined

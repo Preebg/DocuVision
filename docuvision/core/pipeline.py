@@ -7,16 +7,17 @@ Happy-path transitions (each recorded via ``PipelineRepository``):
 Fault protection:
 
 * Before extraction (LAYOUT), jobs with ``retry_count >= max_retries`` are
-  dead-lettered to ``FAILED`` with ``metadata.dead_letter = true``.
+  isolated as ``QUARANTINED`` with ``metadata.dead_letter = true``.
 * ``TransientError`` increments ``retry_count`` and reverts status to ``QUEUED``.
-* ``ValidationError`` / ``FatalProcessingError`` fail immediately (no retry).
+* Terminal wave exceptions are classified, traced, and quarantined.
 """
 
 from __future__ import annotations
 
 import logging
 import traceback
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from docuvision.core.contracts import (
     LayoutExtractor,
@@ -31,10 +32,40 @@ from docuvision.core.errors import (
     TransientError,
     ValidationError,
 )
-from docuvision.core.models import DocumentJob, PipelineResult, PipelineStatus
+from docuvision.core.models import (
+    DocumentJob,
+    PipelineResult,
+    PipelineStatus,
+    QuarantineReason,
+)
 from docuvision.core.observability import bind_correlation, configure_json_logger
 
 logger = configure_json_logger("docuvision.pipeline")
+_T = TypeVar("_T")
+_MAX_ERROR_STACK_CHARS = 32_000
+
+
+class QuarantineBoundaryError(Exception):
+    """Carries wave context and the original traceback to the outer boundary."""
+
+    def __init__(self, stage: str, cause: BaseException, error_stack: str) -> None:
+        super().__init__(str(cause))
+        self.stage = stage
+        self.cause = cause
+        self.error_stack = error_stack[-_MAX_ERROR_STACK_CHARS:]
+
+
+def execute_with_quarantine_boundary(
+    stage: str,
+    operation: Callable[[], _T],
+) -> _T:
+    """Execute one wave, preserving transient retries and isolating all else."""
+    try:
+        return operation()
+    except TransientError:
+        raise
+    except BaseException as exc:
+        raise QuarantineBoundaryError(stage, exc, traceback.format_exc()) from exc
 
 
 class DocumentPipeline:
@@ -63,7 +94,7 @@ class DocumentPipeline:
         self._log = logger_ or logger
 
     def process(self, file_name: str) -> PipelineResult:
-        """Execute the full happy-path (or record ``FAILED`` / re-queue)."""
+        """Execute the full happy-path (or quarantine / re-queue)."""
         job = self._repository.create_job(file_name)
         correlation_id = job.id
         job_log = bind_correlation(self._log, correlation_id)
@@ -114,13 +145,26 @@ class DocumentPipeline:
             return self._handle_transient(
                 job, file_name, local_path, exc, job_log, correlation_id
             )
-        except (ValidationError, FatalProcessingError) as exc:
-            return self._handle_non_retryable(
-                job, file_name, local_path, exc, job_log, correlation_id
+        except QuarantineBoundaryError as exc:
+            return self._quarantine_failure(
+                job,
+                file_name,
+                local_path,
+                exc.cause,
+                job_log,
+                correlation_id,
+                failed_stage=exc.stage,
+                error_stack=exc.error_stack,
             )
         except Exception as exc:
-            return self._handle_failure(
-                job, file_name, local_path, exc, job_log, correlation_id
+            return self._quarantine_failure(
+                job,
+                file_name,
+                local_path,
+                exc,
+                job_log,
+                correlation_id,
+                failed_stage="ORCHESTRATION",
             )
 
     def process_next(self) -> PipelineResult | None:
@@ -148,15 +192,10 @@ class DocumentPipeline:
     ) -> tuple[DocumentJob, str]:
         job = self._persist(job, PipelineStatus.SCANNING, job_log)
         job_log.info("pipeline.state → %s", PipelineStatus.SCANNING.value)
-        try:
-            local_path = self._storage.fetch_to_workspace(file_name)
-        except TransientError:
-            raise
-        except Exception as exc:
-            raise TransientError(
-                f"Failed to fetch '{file_name}' into workspace: {exc}",
-                correlation_id=job.id,
-            ) from exc
+        local_path = execute_with_quarantine_boundary(
+            "SCANNING",
+            lambda: self._storage.fetch_to_workspace(file_name),
+        )
         job = self._persist(
             job, PipelineStatus.SCANNING, job_log, local_path=local_path
         )
@@ -170,19 +209,10 @@ class DocumentPipeline:
     ) -> DocumentJob:
         job = self._persist(job, PipelineStatus.LAYOUT, job_log)
         job_log.info("pipeline.state → %s", PipelineStatus.LAYOUT.value)
-        try:
-            layout_markdown = self._layout.extract_layout(local_path)
-        except TransientError:
-            raise
-        except ValidationError:
-            raise
-        except FatalProcessingError:
-            raise
-        except Exception as exc:
-            raise ValidationError(
-                f"Layout extraction failed for '{job.file_name}': {exc}",
-                correlation_id=job.id,
-            ) from exc
+        layout_markdown = execute_with_quarantine_boundary(
+            "LAYOUT",
+            lambda: self._layout.extract_layout(local_path),
+        )
         return self._persist(
             job, PipelineStatus.LAYOUT, job_log, layout_markdown=layout_markdown
         )
@@ -196,25 +226,10 @@ class DocumentPipeline:
         job = self._persist(job, PipelineStatus.VISION, job_log)
         job_log.info("pipeline.state → %s", PipelineStatus.VISION.value)
         layout_markdown = job.layout_markdown or ""
-        try:
-            payload = self._vision.extract_fields(local_path, layout_markdown)
-        except TransientError:
-            raise
-        except ValidationError:
-            raise
-        except FatalProcessingError:
-            raise
-        except Exception as exc:
-            # Prefer taxonomy mapping: schema/corrupt → ValidationError.
-            if exc.__class__.__name__ == "ValidationError":
-                raise ValidationError(
-                    f"Vision extraction validation failed for '{job.file_name}': {exc}",
-                    correlation_id=job.id,
-                ) from exc
-            raise FatalProcessingError(
-                f"Vision extraction failed for '{job.file_name}': {exc}",
-                correlation_id=job.id,
-            ) from exc
+        payload = execute_with_quarantine_boundary(
+            "VISION",
+            lambda: self._vision.extract_fields(local_path, layout_markdown),
+        )
         return self._persist(
             job, PipelineStatus.VISION, job_log, extracted_payload=payload
         )
@@ -228,15 +243,10 @@ class DocumentPipeline:
     ) -> DocumentJob:
         job = self._persist(job, PipelineStatus.STAGING, job_log)
         job_log.info("pipeline.state → %s", PipelineStatus.STAGING.value)
-        try:
-            self._storage.stage_for_verification(file_name, local_path)
-        except TransientError:
-            raise
-        except Exception as exc:
-            raise InfrastructureError(
-                f"Staging failed for '{file_name}': {exc}",
-                correlation_id=job.id,
-            ) from exc
+        execute_with_quarantine_boundary(
+            "STAGING",
+            lambda: self._storage.stage_for_verification(file_name, local_path),
+        )
         return job
 
     def _transition_pending_verification(
@@ -328,42 +338,17 @@ class DocumentPipeline:
             job.retry_count,
             self._max_retries,
         )
-        try:
-            failed = self._persist(
-                job,
-                PipelineStatus.FAILED,
-                job_log,
-                error_message=error_message,
-                retry_count=job.retry_count,
-                metadata=metadata,
-            )
-        except Exception as state_exc:
-            job_log.error(
-                "pipeline.state_error could not record dead-letter FAILED: %s",
-                state_exc,
-            )
-            failed = job.transition_to(
-                PipelineStatus.FAILED,
-                error_message=error_message,
-                retry_count=job.retry_count,
-                metadata=metadata,
-            )
-
-        try:
-            self._storage.mark_failed(file_name, local_path)
-        except Exception as storage_exc:
-            job_log.warning(
-                "pipeline.storage_deadletter_error error=%s",
-                storage_exc,
-            )
-
-        return PipelineResult(
-            job_id=failed.id,
-            file_name=file_name,
-            success=False,
-            status=PipelineStatus.FAILED,
-            error_message=error_message,
-            correlation_id=correlation_id,
+        saved = self._repository.save_job(job.model_copy(update={"metadata": metadata}))
+        return self._quarantine_failure(
+            saved,
+            file_name,
+            local_path,
+            RuntimeError(error_message),
+            job_log,
+            correlation_id,
+            failed_stage="RETRY",
+            reason=QuarantineReason.RETRY_EXHAUSTED,
+            error_stack=error_message,
         )
 
     def _handle_transient(
@@ -387,7 +372,13 @@ class DocumentPipeline:
         )
 
         if next_retry >= self._max_retries:
-            bumped = job.model_copy(update={"retry_count": next_retry})
+            bumped = self._persist(
+                job,
+                job.status,
+                job_log,
+                retry_count=next_retry,
+                error_message=str(exc),
+            )
             return self._dead_letter(
                 bumped, file_name, local_path, job_log, correlation_id
             )
@@ -427,67 +418,30 @@ class DocumentPipeline:
             correlation_id=correlation_id,
         )
 
-    def _handle_non_retryable(
-        self,
-        job: DocumentJob,
-        file_name: str,
-        local_path: str | None,
-        exc: ValidationError | FatalProcessingError,
-        job_log: logging.LoggerAdapter[logging.Logger],
-        correlation_id: str,
-    ) -> PipelineResult:
-        error_message = str(exc)
-        metadata = {
-            **job.metadata,
-            "validation_failures": [error_message],
-            "error_class": type(exc).__name__,
-            "error_traceback": traceback.format_exc(),
-            "dead_letter": False,
-        }
-        job_log.critical(
-            "pipeline.non_retryable_failure file_name=%s error_class=%s error=%s",
-            file_name,
-            type(exc).__name__,
-            error_message,
-        )
+    @staticmethod
+    def _classify_quarantine_reason(
+        failed_stage: str,
+        exc: BaseException,
+    ) -> QuarantineReason:
+        chain: list[str] = []
+        current: BaseException | None = exc
+        while current is not None and len(chain) < 8:
+            chain.append(f"{type(current).__name__}: {current}".casefold())
+            current = current.__cause__ or current.__context__
+        diagnostic = " ".join(chain)
+        if any(token in diagnostic for token in ("out of memory", "vram", "cuda oom")):
+            return QuarantineReason.VRAM_OOM
+        if "timeout" in diagnostic or "timed out" in diagnostic:
+            return QuarantineReason.NETWORK_TIMEOUT
+        if failed_stage == "LAYOUT":
+            return QuarantineReason.PARSING_ERROR
+        if isinstance(exc, ValidationError) or "validation" in diagnostic or "schema" in diagnostic:
+            return QuarantineReason.VALIDATION_FAILED
+        if isinstance(exc, InfrastructureError):
+            return QuarantineReason.INFRASTRUCTURE_ERROR
+        return QuarantineReason.PROCESSING_ERROR
 
-        try:
-            failed = self._persist(
-                job,
-                PipelineStatus.FAILED,
-                job_log,
-                error_message=error_message,
-                metadata=metadata,
-            )
-        except Exception as state_exc:
-            job_log.error(
-                "pipeline.state_error could not record FAILED: %s",
-                state_exc,
-            )
-            failed = job.transition_to(
-                PipelineStatus.FAILED,
-                error_message=error_message,
-                metadata=metadata,
-            )
-
-        try:
-            self._storage.mark_failed(file_name, local_path)
-        except Exception as storage_exc:
-            job_log.warning(
-                "pipeline.storage_deadletter_error error=%s",
-                storage_exc,
-            )
-
-        return PipelineResult(
-            job_id=failed.id,
-            file_name=file_name,
-            success=False,
-            status=PipelineStatus.FAILED,
-            error_message=error_message,
-            correlation_id=correlation_id,
-        )
-
-    def _handle_failure(
+    def _quarantine_failure(
         self,
         job: DocumentJob,
         file_name: str,
@@ -495,44 +449,73 @@ class DocumentPipeline:
         exc: BaseException,
         job_log: logging.LoggerAdapter[logging.Logger],
         correlation_id: str,
+        *,
+        failed_stage: str,
+        reason: QuarantineReason | None = None,
+        error_stack: str | None = None,
     ) -> PipelineResult:
-        error_message = str(exc)
-        error_class = type(exc).__name__
-        job_log.error(
-            "pipeline.failure file_name=%s error_class=%s error=%s",
-            file_name,
-            error_class,
-            error_message,
+        resolved_reason = reason or self._classify_quarantine_reason(
+            failed_stage, exc
         )
-
+        stack = (error_stack or traceback.format_exc())[-_MAX_ERROR_STACK_CHARS:]
+        if stack.strip() == "NoneType: None":
+            stack = f"{type(exc).__name__}: {exc}"
+        job_log.error(
+            "pipeline.quarantine file_name=%s stage=%s reason=%s error=%s",
+            file_name,
+            failed_stage,
+            resolved_reason.value,
+            exc,
+        )
         try:
-            failed = self._repository.mark_failed(job.id, error_message)
+            item = self._repository.begin_quarantine(
+                job.id,
+                reason=resolved_reason,
+                error_stack=stack,
+                failed_stage=failed_stage,
+            )
         except Exception as state_exc:
-            job_log.error(
-                "pipeline.state_error could not record FAILED: %s",
+            job_log.critical(
+                "pipeline.quarantine_persist_failed document_id=%s error=%s",
+                job.id,
                 state_exc,
             )
-            failed = job.transition_to(
-                PipelineStatus.FAILED, error_message=error_message
+            # Preserve existing behavior as a final database fallback.
+            failed = self._repository.mark_failed(job.id, str(exc))
+            return PipelineResult(
+                job_id=failed.id,
+                file_name=file_name,
+                success=False,
+                status=failed.status,
+                error_message=str(exc),
+                correlation_id=correlation_id,
             )
 
         try:
-            self._storage.mark_failed(file_name, local_path)
+            locator = self._storage.quarantine_payload(
+                job.id,
+                file_name,
+                local_path,
+            )
+            self._repository.set_quarantine_locator(item.id, locator)
         except Exception as storage_exc:
-            job_log.warning(
-                "pipeline.storage_deadletter_error error=%s",
+            # The DB transition happens first: a crash/failure cannot cause the
+            # worker to claim the document again. Redrive can recover from
+            # incoming/failed/verification roots when no locator was recorded.
+            job_log.exception(
+                "pipeline.quarantine_storage_incomplete document_id=%s error=%s",
+                job.id,
                 storage_exc,
             )
 
         return PipelineResult(
-            job_id=failed.id,
+            job_id=job.id,
             file_name=file_name,
             success=False,
-            status=PipelineStatus.FAILED,
-            error_message=error_message,
+            status=PipelineStatus.QUARANTINED,
+            error_message=str(exc),
             correlation_id=correlation_id,
         )
-
 
 __all__ = [
     "DocumentPipeline",

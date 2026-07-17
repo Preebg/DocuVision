@@ -64,6 +64,13 @@ class Settings(BaseSettings):
         default=None,
         description="Dead-letter area. Defaults to ``{data_root}/failed``.",
     )
+    pipeline_quarantine_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Extraction quarantine root. "
+            "Defaults to ``{data_root}/quarantine/pipeline``."
+        ),
+    )
     verification_dir: Path | None = Field(
         default=None,
         description="HITL staging area. Defaults to ``{data_root}/verification``.",
@@ -265,6 +272,11 @@ class Settings(BaseSettings):
     def resolved_failed_dir(self) -> Path:
         return self.failed_dir or (self.data_root / "failed")
 
+    def resolved_pipeline_quarantine_dir(self) -> Path:
+        return self.pipeline_quarantine_dir or (
+            self.data_root / "quarantine" / "pipeline"
+        )
+
     def resolved_verification_dir(self) -> Path:
         return self.verification_dir or (self.data_root / "verification")
 
@@ -308,6 +320,7 @@ class Settings(BaseSettings):
             self.resolved_incoming_dir(),
             self.resolved_processed_dir(),
             self.resolved_failed_dir(),
+            self.resolved_pipeline_quarantine_dir(),
             self.resolved_verification_dir(),
             self.resolved_workspace_dir(),
             self.resolved_release_dir(),
