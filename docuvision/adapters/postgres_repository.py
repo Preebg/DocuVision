@@ -282,6 +282,222 @@ class PostgresPipelineRepository:
                 batches.append(batch)
         return batches
 
+    def get_batch_split_children(
+        self,
+        batch_id: str,
+        parent_document_id: str,
+    ) -> list[tuple[str, str, int, int, int, int]]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    d.id,
+                    d.filename,
+                    l.part_index,
+                    l.source_start_page,
+                    l.source_end_page,
+                    bd.sequence_no
+                FROM document_split_lineage l
+                INNER JOIN documents d ON d.id = l.child_document_id
+                INNER JOIN batch_documents bd
+                    ON bd.batch_id = l.batch_id
+                    AND bd.document_id = l.child_document_id
+                WHERE l.batch_id = %s AND l.parent_document_id = %s
+                ORDER BY l.part_index ASC
+                """,
+                (batch_id, parent_document_id),
+            ).fetchall()
+        return [
+            (
+                row["id"],
+                row["filename"],
+                int(row["part_index"]),
+                int(row["source_start_page"]),
+                int(row["source_end_page"]),
+                int(row["sequence_no"]),
+            )
+            for row in rows
+        ]
+
+    def commit_batch_split(
+        self,
+        batch_id: str,
+        parent_document_id: str,
+        children: Sequence[tuple[str, int, int]],
+        *,
+        strategy: str,
+    ) -> list[DocumentJob]:
+        if not children:
+            raise ValueError("A batch split must contain at least one child.")
+        existing = self.get_batch_split_children(batch_id, parent_document_id)
+        if existing:
+            jobs = [self.get_job(item[0]) for item in existing]
+            return [job for job in jobs if job is not None]
+
+        parent = self.get_job(parent_document_id)
+        if parent is None:
+            raise KeyError(f"Document not found: {parent_document_id}")
+        if parent.status != PipelineStatus.QUEUED:
+            raise ValueError("Only a queued source document can be split.")
+
+        now = _utc_iso()
+        part_count = len(children)
+        created: list[DocumentJob] = []
+        with self._pool.connection() as connection:
+            link = connection.execute(
+                """
+                SELECT sequence_no FROM batch_documents
+                WHERE batch_id = %s AND document_id = %s
+                FOR UPDATE
+                """,
+                (batch_id, parent_document_id),
+            ).fetchone()
+            if link is None:
+                raise KeyError("Source document is not linked to the requested batch.")
+            if connection.execute(
+                """
+                SELECT 1 FROM document_split_lineage
+                WHERE batch_id = %s AND parent_document_id = %s LIMIT 1
+                """,
+                (batch_id, parent_document_id),
+            ).fetchone():
+                raise RuntimeError("Concurrent split already committed.")
+
+            source_sequence = int(link["sequence_no"])
+            delta = part_count - 1
+            if delta:
+                connection.execute(
+                    """
+                    UPDATE batch_documents
+                    SET sequence_no = sequence_no + %s
+                    WHERE batch_id = %s AND sequence_no > %s
+                    """,
+                    (delta, batch_id, source_sequence),
+                )
+            connection.execute(
+                """
+                DELETE FROM batch_documents
+                WHERE batch_id = %s AND document_id = %s
+                """,
+                (batch_id, parent_document_id),
+            )
+
+            for part_index, (file_name, start_page, end_page) in enumerate(
+                children, start=1
+            ):
+                if start_page < 1 or end_page < start_page:
+                    raise ValueError("Invalid child source page range.")
+                job = DocumentJob(
+                    file_name=file_name,
+                    status=PipelineStatus.QUEUED,
+                    metadata={
+                        "split_parent_document_id": parent_document_id,
+                        "split_batch_id": batch_id,
+                        "part_index": part_index,
+                        "part_count": part_count,
+                        "source_start_page": start_page,
+                        "source_end_page": end_page,
+                        "split_strategy": strategy,
+                    },
+                )
+                connection.execute(
+                    """
+                    INSERT INTO documents (
+                        id, filename, status, retry_count, metadata, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        job.id,
+                        job.file_name,
+                        job.status.value,
+                        job.retry_count,
+                        self._dumps(self._pack_metadata(job)),
+                        job.created_at.isoformat(),
+                    ),
+                )
+                sequence_no = source_sequence + part_index - 1
+                connection.execute(
+                    """
+                    INSERT INTO batch_documents (batch_id, document_id, sequence_no)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (batch_id, job.id, sequence_no),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO document_split_lineage (
+                        parent_document_id, child_document_id, batch_id,
+                        part_index, part_count, source_start_page,
+                        source_end_page, strategy, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        parent_document_id,
+                        job.id,
+                        batch_id,
+                        part_index,
+                        part_count,
+                        start_page,
+                        end_page,
+                        strategy,
+                        now,
+                    ),
+                )
+                self._insert_event(
+                    connection,
+                    job_id=job.id,
+                    action="SPLIT_CHILD_CREATED",
+                    from_status=None,
+                    to_status=PipelineStatus.QUEUED.value,
+                    details={
+                        "batch_id": batch_id,
+                        "parent_document_id": parent_document_id,
+                        "part_index": part_index,
+                        "part_count": part_count,
+                        "source_start_page": start_page,
+                        "source_end_page": end_page,
+                        "strategy": strategy,
+                    },
+                )
+                created.append(job)
+
+            parent_metadata = {
+                **parent.metadata,
+                "split_batch_id": batch_id,
+                "split_part_count": part_count,
+                "split_strategy": strategy,
+                "split_completed_at": now,
+            }
+            split_parent = parent.transition_to(
+                PipelineStatus.SPLIT_PARENT, metadata=parent_metadata
+            )
+            connection.execute(
+                "UPDATE documents SET status = %s, metadata = %s WHERE id = %s",
+                (
+                    split_parent.status.value,
+                    self._dumps(self._pack_metadata(split_parent)),
+                    parent_document_id,
+                ),
+            )
+            connection.execute(
+                "UPDATE batches SET updated_at = %s WHERE id = %s",
+                (now, batch_id),
+            )
+            self._insert_event(
+                connection,
+                job_id=parent_document_id,
+                action="BATCH_SPLIT_COMPLETED",
+                from_status=parent.status.value,
+                to_status=PipelineStatus.SPLIT_PARENT.value,
+                details={
+                    "batch_id": batch_id,
+                    "part_count": part_count,
+                    "strategy": strategy,
+                },
+            )
+            connection.commit()
+        return created
+
     def update_batch_status(
         self,
         batch_id: str,

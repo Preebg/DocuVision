@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 
 from docuvision.adapters.local_storage import LocalStorageAdapter
+from docuvision.adapters.pdf_batch_splitter import PyMuPdfBatchSplitter
 from docuvision.adapters.postgres_repository import PostgresPipelineRepository
 from docuvision.adapters.release import FSDropExporter, ReleaseExporter
 from docuvision.adapters.sqlite_repository import SqlitePipelineRepository
 from docuvision.config.settings import Settings
 from docuvision.core.contracts import PipelineRepository
+from docuvision.core.batch_splitting import BatchSplitEngine
 from docuvision.core.release import ReleaseEngine
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,18 @@ def build_release_exporter(settings: Settings) -> ReleaseExporter:
     release_dir = settings.resolved_release_dir()
     logger.info("composition.release_exporter=fs_drop dir=%s", release_dir)
     return FSDropExporter(release_dir)
+
+
+def build_batch_split_engine(
+    storage: LocalStorageAdapter,
+    repository: PipelineRepository,
+) -> BatchSplitEngine:
+    """Compose the physical batch-separator service."""
+    return BatchSplitEngine(
+        repository=repository,
+        storage=storage,
+        splitter=PyMuPdfBatchSplitter(),
+    )
 
 
 def build_release_engine(

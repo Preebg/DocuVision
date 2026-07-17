@@ -153,7 +153,7 @@ def lifecycle_status(status: PipelineStatus) -> DocumentLifecycleStatus:
         return DocumentLifecycleStatus.QUARANTINED
     if status == PipelineStatus.FAILED:
         return DocumentLifecycleStatus.FAILED
-    if status == PipelineStatus.VERIFIED:
+    if status in {PipelineStatus.VERIFIED, PipelineStatus.SPLIT_PARENT}:
         return DocumentLifecycleStatus.COMPLETED
     return DocumentLifecycleStatus.PROCESSING
 

@@ -20,7 +20,12 @@ from docuvision.api.auth import install_api_auth
 from docuvision.api import operator_auth
 from docuvision.api.routes import batches, documents, ingestion, quarantine, queue
 from docuvision.api.schemas import HealthResponse
-from docuvision.composition import build_backends, build_release_engine, build_release_exporter
+from docuvision.composition import (
+    build_backends,
+    build_batch_split_engine,
+    build_release_engine,
+    build_release_exporter,
+)
 from docuvision.config.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -30,6 +35,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     storage, repository = build_backends(settings)
+    batch_split_engine = build_batch_split_engine(storage, repository)
     release_exporter = build_release_exporter(settings)
     release_engine = build_release_engine(
         settings,
@@ -40,6 +46,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.settings = settings
     app.state.storage = storage
     app.state.repository = repository
+    app.state.batch_split_engine = batch_split_engine
     app.state.release_exporter = release_exporter
     app.state.release_engine = release_engine
     app.state.repository_kind = "postgres" if settings.database_url else "sqlite"

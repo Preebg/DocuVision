@@ -152,6 +152,64 @@ export async function ingestDocument(file: File): Promise<{
   };
 }
 
+export type BatchSplitStrategy =
+  | {
+      strategy: "barcode";
+      separator_values?: string[];
+      dpi?: number;
+    }
+  | {
+      strategy: "blank_page";
+      non_white_threshold?: number;
+      white_cutoff?: number;
+      dpi?: number;
+    }
+  | {
+      strategy: "fixed_interval";
+      pages_per_document: number;
+    };
+
+export type BatchSplitResult = {
+  batch_id: string;
+  parent_document_id: string;
+  strategy: BatchSplitStrategy["strategy"];
+  source_page_count: number;
+  separator_pages: number[];
+  parts: Array<{
+    document_id: string;
+    file_name: string;
+    part_index: number;
+    part_count: number;
+    start_page: number;
+    end_page: number;
+    sequence_no: number;
+  }>;
+  idempotent_replay: boolean;
+};
+
+export async function processBatchSplits(
+  batchId: string,
+  sourceDocumentId: string,
+  strategyConfig: BatchSplitStrategy,
+): Promise<BatchSplitResult> {
+  const response = await apiFetch(
+    `/api/batches/${encodeURIComponent(batchId)}/split`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source_document_id: sourceDocumentId,
+        strategy_config: strategyConfig,
+      }),
+    },
+  );
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || `Batch split failed (${response.status})`);
+  }
+  return (await response.json()) as BatchSplitResult;
+}
+
 export type DocumentPatchBody = {
   action: "approve" | "reject";
   verified_payload?: import("@/lib/types").ExtractedPayload | null;

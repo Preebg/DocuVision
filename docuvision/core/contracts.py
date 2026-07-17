@@ -82,6 +82,10 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def remove_incoming(self, file_names: Sequence[str]) -> None:
+        """Delete only the named ingress files during a failed atomic handoff."""
+        ...
+
 
 @runtime_checkable
 class PipelineRepository(Protocol):
@@ -119,6 +123,25 @@ class PipelineRepository(Protocol):
 
     def list_batches_for_document(self, document_id: str) -> list[Batch]:
         """Return batches that include ``document_id`` (ordered membership)."""
+        ...
+
+    def get_batch_split_children(
+        self,
+        batch_id: str,
+        parent_document_id: str,
+    ) -> list[tuple[str, str, int, int, int, int]]:
+        """Return child id/name, part index, page range, and batch sequence."""
+        ...
+
+    def commit_batch_split(
+        self,
+        batch_id: str,
+        parent_document_id: str,
+        children: Sequence[tuple[str, int, int]],
+        *,
+        strategy: str,
+    ) -> list[DocumentJob]:
+        """Atomically replace a source batch member with queued child jobs."""
         ...
 
     def update_batch_status(

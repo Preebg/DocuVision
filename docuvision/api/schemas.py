@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from docuvision.core.batch_splitting import StrategyConfig
+
 
 class DocumentJobOut(BaseModel):
     """SPA-facing document row (mirrors DocumentPipelineRow)."""
@@ -74,6 +76,33 @@ class BatchPendingOut(BaseModel):
 
 class BatchPendingResponse(BaseModel):
     batches: list[BatchPendingOut] = Field(default_factory=list)
+
+
+class BatchSplitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_document_id: str = Field(min_length=1, max_length=128)
+    strategy_config: StrategyConfig
+
+
+class BatchSplitPartOut(BaseModel):
+    document_id: str
+    file_name: str
+    part_index: int
+    part_count: int
+    start_page: int
+    end_page: int
+    sequence_no: int
+
+
+class BatchSplitResponse(BaseModel):
+    batch_id: str
+    parent_document_id: str
+    strategy: str
+    source_page_count: int
+    separator_pages: list[int] = Field(default_factory=list)
+    parts: list[BatchSplitPartOut] = Field(default_factory=list)
+    idempotent_replay: bool = False
 
 
 class HealthResponse(BaseModel):

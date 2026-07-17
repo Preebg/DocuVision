@@ -8,12 +8,22 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from docuvision.adapters.local_storage import PROCESSABLE_SUFFIXES, LocalStorageAdapter
-from docuvision.api.deps import get_repository, get_storage
+from docuvision.api.deps import (
+    get_batch_split_engine,
+    get_repository,
+    get_storage,
+)
 from docuvision.api.schemas import (
     BatchDocumentOut,
     BatchIngestResponse,
     BatchPendingOut,
     BatchPendingResponse,
+    BatchSplitRequest,
+    BatchSplitResponse,
+)
+from docuvision.core.batch_splitting import (
+    BatchSplitEngine,
+    PdfSplitError,
 )
 from docuvision.core.contracts import PipelineRepository
 
@@ -97,6 +107,42 @@ async def ingest_batch(
         source_id=batch.source_id,
         documents=document_outs,
     )
+
+
+@router.post(
+    "/api/batches/{batch_id}/split",
+    response_model=BatchSplitResponse,
+)
+def process_batch_splits(
+    batch_id: str,
+    request: BatchSplitRequest,
+    storage: LocalStorageAdapter = Depends(get_storage),
+    repository: PipelineRepository = Depends(get_repository),
+    engine: BatchSplitEngine = Depends(get_batch_split_engine),
+) -> BatchSplitResponse:
+    """Detect physical separators and replace one source with queued children."""
+    job = repository.get_job(request.source_document_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Source document not found.")
+    try:
+        source_path = storage.resolve_document_path(
+            job.file_name, prefer_verification=False
+        )
+        result = engine.process_batch_splits(
+            batch_id,
+            str(source_path),
+            request.strategy_config,
+            source_document_id=job.id,
+        )
+        return BatchSplitResponse.model_validate(result.model_dump())
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    except PdfSplitError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/api/batches/pending", response_model=BatchPendingResponse)

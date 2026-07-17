@@ -213,10 +213,23 @@ class LocalStorageAdapter:
         Returns stored basenames in the same order as ``documents``.
         """
         stored: list[str] = []
-        for file_name, source in documents:
-            stored.append(self.write_incoming(file_name, source))
+        try:
+            for file_name, source in documents:
+                stored.append(self.write_incoming(file_name, source))
+        except Exception:
+            self.remove_incoming(stored)
+            raise
         logger.info("storage.write_incoming_batch count=%s", len(stored))
         return stored
+
+    def remove_incoming(self, file_names: Sequence[str]) -> None:
+        """Rollback files created by a failed split database transaction."""
+        for file_name in file_names:
+            path = self._safe_join(self._incoming, file_name)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("storage.remove_incoming failed path=%s", path)
 
     def resolve_document_path(
         self,

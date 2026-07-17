@@ -7,6 +7,7 @@ from fastapi import Request
 from docuvision.adapters.local_storage import LocalStorageAdapter
 from docuvision.adapters.release import ReleaseExporter
 from docuvision.core.contracts import PipelineRepository
+from docuvision.core.batch_splitting import BatchSplitEngine
 from docuvision.core.release import ReleaseEngine
 
 
@@ -16,6 +17,10 @@ def get_storage(request: Request) -> LocalStorageAdapter:
 
 def get_repository(request: Request) -> PipelineRepository:
     return request.app.state.repository
+
+
+def get_batch_split_engine(request: Request) -> BatchSplitEngine:
+    return request.app.state.batch_split_engine
 
 
 def get_release_exporter(request: Request) -> ReleaseExporter:
