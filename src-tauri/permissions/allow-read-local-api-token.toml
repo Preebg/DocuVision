@@ -11,3 +11,11 @@ commands.allow = [
   "read_operator_session",
   "delete_operator_session",
 ]
+
+[[permission]]
+identifier = "allow-native-scanner"
+description = "Allow the main desktop window to enumerate scanners and acquire pages."
+commands.allow = [
+  "list_scanners",
+  "acquire_scan",
+]

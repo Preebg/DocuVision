@@ -1,6 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
+mod commands;
+mod scanner;
+
 const OPERATOR_SESSION_SERVICE: &str = "dev.preebg.docuvision";
 const OPERATOR_SESSION_ACCOUNT: &str = "operator-session";
 const MAX_SESSION_BYTES: usize = 64 * 1024;
@@ -112,12 +115,15 @@ fn delete_operator_session() -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(commands::ScannerState::default())
         .plugin(tauri_plugin_http::init())
         .invoke_handler(tauri::generate_handler![
             read_local_api_token,
             write_operator_session,
             read_operator_session,
-            delete_operator_session
+            delete_operator_session,
+            commands::list_scanners,
+            commands::acquire_scan
         ])
         .run(tauri::generate_context!())
         .expect("error while running DocuVision");

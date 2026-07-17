@@ -7,6 +7,7 @@
     "core:default",
     "allow-read-local-api-token",
     "allow-operator-session-keyring",
+    "allow-native-scanner",
     {
       "identifier": "http:default",
       "allow": [
