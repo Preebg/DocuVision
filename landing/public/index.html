@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DocuVision — On-prem document intelligence</title>
+    <meta
+      name="description"
+      content="DocuVision turns scanned paper and PDFs into verified structured data on your LAN — local vision models, fault isolation, and a human gate before release."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="noise" aria-hidden="true"></div>
+
+    <header class="site-header">
+      <a class="logo-mark" href="#top" aria-label="DocuVision home">
+        <span class="logo-glyph" aria-hidden="true"></span>
+        DocuVision
+      </a>
+      <nav class="site-nav" aria-label="Primary">
+        <a href="#what">What it does</a>
+        <a href="#compare">Compare</a>
+        <a href="#flow">Pipeline</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="brand">
+        <div class="hero-copy">
+          <p class="eyebrow">On-prem · LAN-only · Human-verified</p>
+          <h1 id="brand" class="brand">DocuVision</h1>
+          <p class="lede">
+            Turn paper and PDFs into structured records that never leave your
+            network — extracted by local vision models, gated by a human before
+            release.
+          </p>
+          <div class="cta-row">
+            <a class="btn btn-primary" href="#what">See how it works</a>
+            <a class="btn btn-ghost" href="#compare">Us vs. the field</a>
+          </div>
+        </div>
+
+        <div class="hero-stage" aria-hidden="true">
+          <div class="stage-frame">
+            <div class="doc-stack">
+              <article class="sheet sheet-a">
+                <span class="rule"></span>
+                <span class="rule short"></span>
+                <span class="rule"></span>
+                <span class="field">INVOICE · 4821</span>
+              </article>
+              <article class="sheet sheet-b">
+                <span class="rule"></span>
+                <span class="rule mid"></span>
+                <span class="chip">verified</span>
+              </article>
+              <article class="sheet sheet-c">
+                <span class="rule"></span>
+                <span class="rule short"></span>
+                <span class="kv">vendor → ACME</span>
+              </article>
+            </div>
+            <div class="scan-beam"></div>
+            <div class="stage-grid"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section what" id="what">
+        <div class="section-intro">
+          <h2>What DocuVision is built to do</h2>
+          <p>
+            Not another chat window on a PDF. An explicit document pipeline for
+            shops that need accuracy, auditability, and air-gapped control.
+          </p>
+        </div>
+
+        <ol class="capability-list">
+          <li class="reveal">
+            <span class="cap-index">01</span>
+            <div>
+              <h3>Ingest from the physical world</h3>
+              <p>
+                Watch scanner drops and SMB shares. Pull pages into a workspace
+                as batches — the unit of work is a set of pages, not a lonely
+                file.
+              </p>
+            </div>
+          </li>
+          <li class="reveal">
+            <span class="cap-index">02</span>
+            <div>
+              <h3>Extract with local vision models</h3>
+              <p>
+                Run Docling, OCR, and vision LLMs on your own Mini PC. Spawned
+                workers, GPU locks, and memory caps keep VRAM from leaking across
+                jobs.
+              </p>
+            </div>
+          </li>
+          <li class="reveal">
+            <span class="cap-index">03</span>
+            <div>
+              <h3>Isolate faults instead of crashing</h3>
+              <p>
+                Poisoned documents quarantine and redrive. Dead-letter after
+                retries. The pipeline is a state machine with protocol
+                boundaries — not a hope-and-retry loop.
+              </p>
+            </div>
+          </li>
+          <li class="reveal">
+            <span class="cap-index">04</span>
+            <div>
+              <h3>Require a human before release</h3>
+              <p>
+                Every record passes a verification station. Operators confirm
+                fields; only then does structured data land in the release drop
+                for downstream systems.
+              </p>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <section class="section compare" id="compare">
+        <div class="section-intro">
+          <h2>Us vs. everyone else</h2>
+          <p>
+            Cloud document AI, chat-on-PDF tools, and classic OCR each solve a
+            slice. DocuVision is the stack for teams that refuse to ship paper
+            off-site.
+          </p>
+        </div>
+
+        <div class="compare-wrap reveal" role="region" aria-label="Competitive comparison">
+          <table class="compare-table">
+            <thead>
+              <tr>
+                <th scope="col">Capability</th>
+                <th scope="col" class="us">Us</th>
+                <th scope="col">Cloud Document AI</th>
+                <th scope="col">Chat-on-PDF</th>
+                <th scope="col">Classic OCR</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th scope="row">Runs fully on your LAN</th>
+                <td class="us" data-label="Us"><span class="yes">Yes</span></td>
+                <td data-label="Cloud Document AI"><span class="no">No</span></td>
+                <td data-label="Chat-on-PDF"><span class="no">Rarely</span></td>
+                <td data-label="Classic OCR"><span class="mid">Sometimes</span></td>
+              </tr>
+              <tr>
+                <th scope="row">Local vision models</th>
+                <td class="us" data-label="Us"><span class="yes">Built-in</span></td>
+                <td data-label="Cloud Document AI"><span class="no">Vendor cloud</span></td>
+                <td data-label="Chat-on-PDF"><span class="no">Provider API</span></td>
+                <td data-label="Classic OCR"><span class="no">Rules / templates</span></td>
+              </tr>
+              <tr>
+                <th scope="row">Human verification gate</th>
+                <td class="us" data-label="Us"><span class="yes">Required</span></td>
+                <td data-label="Cloud Document AI"><span class="mid">Optional UI</span></td>
+                <td data-label="Chat-on-PDF"><span class="no">None</span></td>
+                <td data-label="Classic OCR"><span class="mid">Manual export</span></td>
+              </tr>
+              <tr>
+                <th scope="row">Fault quarantine &amp; redrive</th>
+                <td class="us" data-label="Us"><span class="yes">First-class</span></td>
+                <td data-label="Cloud Document AI"><span class="mid">Opaque retries</span></td>
+                <td data-label="Chat-on-PDF"><span class="no">Fail the chat</span></td>
+                <td data-label="Classic OCR"><span class="mid">Operator cleanup</span></td>
+              </tr>
+              <tr>
+                <th scope="row">Batch as unit of work</th>
+                <td class="us" data-label="Us"><span class="yes">Yes</span></td>
+                <td data-label="Cloud Document AI"><span class="mid">Per document</span></td>
+                <td data-label="Chat-on-PDF"><span class="no">Per prompt</span></td>
+                <td data-label="Classic OCR"><span class="mid">Per job</span></td>
+              </tr>
+              <tr>
+                <th scope="row">Air-gap friendly auth</th>
+                <td class="us" data-label="Us"><span class="yes">LAN JWT / API key</span></td>
+                <td data-label="Cloud Document AI"><span class="no">Cloud IdP</span></td>
+                <td data-label="Chat-on-PDF"><span class="no">SaaS login</span></td>
+                <td data-label="Classic OCR"><span class="mid">Desktop license</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section flow" id="flow">
+        <div class="section-intro">
+          <h2>The path from paper to release</h2>
+          <p>One composition of stages. No mystery hops through someone else’s cloud.</p>
+        </div>
+
+        <ol class="flow-track">
+          <li class="reveal">
+            <span class="flow-step">Scan / drop</span>
+            <span class="flow-arrow" aria-hidden="true"></span>
+          </li>
+          <li class="reveal">
+            <span class="flow-step">Ingest</span>
+            <span class="flow-arrow" aria-hidden="true"></span>
+          </li>
+          <li class="reveal">
+            <span class="flow-step">Extract</span>
+            <span class="flow-arrow" aria-hidden="true"></span>
+          </li>
+          <li class="reveal">
+            <span class="flow-step">Verify</span>
+            <span class="flow-arrow" aria-hidden="true"></span>
+          </li>
+          <li class="reveal">
+            <span class="flow-step">Release</span>
+          </li>
+        </ol>
+      </section>
+
+      <section class="section close" id="close">
+        <h2 class="close-brand">DocuVision</h2>
+        <p>
+          Structured documents. Local inference. A human in the loop — by
+          design, not as an afterthought.
+        </p>
+        <p class="cta-row" style="justify-content: center; margin-top: 1.75rem">
+          <a class="btn btn-primary" href="https://preebg.dev">Want to see other projects?</a>
+        </p>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>docuvision.preebg.dev</span>
+      <span>On-prem document intelligence</span>
+    </footer>
+
+    <script src="./script.js" defer></script>
+  </body>
+</html>

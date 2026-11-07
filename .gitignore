@@ -19,6 +19,8 @@ quarantine/secrets.toml
 
 # Node / Next.js
 /node_modules
+landing/node_modules/
+landing/.wrangler/
 /.next
 /out
 npm-debug.log*

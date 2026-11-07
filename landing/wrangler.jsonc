@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "docuvision-landing",
+  "compatibility_date": "2026-11-07",
+  // Static marketing site for docuvision.preebg.dev
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "404-page"
+  },
+  // Attaches the custom hostname after the Worker exists in your account.
+  // Requires preebg.dev to already be a zone in Cloudflare DNS.
+  "routes": [
+    {
+      "pattern": "docuvision.preebg.dev",
+      "custom_domain": true
+    }
+  ]
+}
